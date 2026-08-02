@@ -81,6 +81,6 @@ El acceso inicial a la página usa la red local, pero el archivo no pasa por ell
 
 ## Notas del protocolo
 
-Rust divide el archivo en un paquete de cabecera y paquetes de datos indexados. El receptor tolera orden arbitrario, duplicados y pérdida de fotogramas. Cada paquete Base64 queda por debajo de 1,800 bytes y la cabecera conserva nombre, tamaño, cantidad de paquetes y checksum FNV-1a.
+Rust divide el archivo en un paquete de cabecera y paquetes de datos indexados. El receptor tolera orden arbitrario, duplicados y pérdida de fotogramas. Cada paquete Base64 queda por debajo de 900 bytes para facilitar la lectura desde una pantalla, y la cabecera conserva nombre, tamaño, cantidad de paquetes y checksum FNV-1a.
 
-El QR selecciona automáticamente la versión necesaria con corrección `M`. Una carga de 1,800 caracteres no cabe físicamente en QR versión 5/6; forzar esas versiones reduciría demasiado la capacidad y haría inviable el límite de 1.5 MiB.
+El QR selecciona automáticamente la versión necesaria con corrección `M`, usa un margen de cuatro módulos y repite cada paquete durante varios fotogramas. Una carga de 1,800 caracteres no cabe físicamente en QR versión 5/6; el límite práctico de 900 caracteres mejora la captura con cámaras móviles.

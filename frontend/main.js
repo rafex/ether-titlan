@@ -8,9 +8,11 @@ import init, {
 
 const MAX_FILE_BYTES = 1.5 * 1024 * 1024;
 const QR_SIZE = 640;
+const PACKET_HOLD_FRAMES = 3;
+const MAX_SCAN_WIDTH = 1280;
 const QR_OPTIONS = {
   errorCorrectionLevel: "M",
-  margin: 1,
+  margin: 4,
   width: QR_SIZE,
   color: { dark: "#000000", light: "#ffffff" },
 };
@@ -23,6 +25,8 @@ const sender = {
   index: 0,
   rendering: false,
   running: false,
+  packetRendered: false,
+  packetFrames: 0,
 };
 const receiver = { stream: null, frame: null, running: false, lastPacket: "" };
 
@@ -66,6 +70,8 @@ function stopSender() {
   sender.running = false;
   sender.frame = null;
   sender.rendering = false;
+  sender.packetRendered = false;
+  sender.packetFrames = 0;
   $("start-sender").disabled = !sender.packets.length;
   $("stop-sender").disabled = true;
 }
@@ -74,6 +80,15 @@ function renderSenderFrame() {
   if (!sender.running) return;
   sender.frame = requestAnimationFrame(renderSenderFrame);
   if (sender.rendering || !sender.packets.length || !window.QRCode) return;
+
+  if (sender.packetRendered) {
+    sender.packetFrames += 1;
+    if (sender.packetFrames < PACKET_HOLD_FRAMES) return;
+    sender.packetRendered = false;
+    sender.packetFrames = 0;
+    sender.index = (sender.index + 1) % sender.packets.length;
+    updateSenderProgress();
+  }
 
   const payload = sender.packets[sender.index];
   sender.rendering = true;
@@ -84,7 +99,8 @@ function renderSenderFrame() {
       setStatus($("sender-file"), `No se pudo generar el QR: ${error.message}`, true);
       return;
     }
-    sender.index = (sender.index + 1) % sender.packets.length;
+    sender.packetRendered = true;
+    sender.packetFrames = 0;
     updateSenderProgress();
   });
 }
@@ -93,9 +109,11 @@ function startSender() {
   if (!sender.packets.length) return;
   sender.running = true;
   sender.index = 0;
+  sender.packetRendered = false;
+  sender.packetFrames = 0;
   $("start-sender").disabled = true;
   $("stop-sender").disabled = false;
-  setStatus($("sender-file"), `${sender.file.name} — emisión activa a ~60 FPS.`);
+  setStatus($("sender-file"), `${sender.file.name} — emisión activa, QR repetido para captura móvil.`);
   renderSenderFrame();
 }
 
@@ -155,13 +173,14 @@ function scanReceiverFrame() {
   const video = $("receiver-video");
   if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth) return;
 
-  const scale = Math.min(1, 960 / video.videoWidth);
-  const width = Math.max(320, Math.round(video.videoWidth * scale));
+  const scale = Math.min(1, MAX_SCAN_WIDTH / video.videoWidth);
+  const width = Math.max(640, Math.round(video.videoWidth * scale));
   const height = Math.round(video.videoHeight * (width / video.videoWidth));
   if (scanCanvas.width !== width || scanCanvas.height !== height) {
     scanCanvas.width = width;
     scanCanvas.height = height;
   }
+  scanContext.imageSmoothingEnabled = false;
   scanContext.drawImage(video, 0, 0, width, height);
   const image = scanContext.getImageData(0, 0, width, height);
   const code = window.jsQR?.(image.data, image.width, image.height, { inversionAttempts: "attemptBoth" });
@@ -180,6 +199,10 @@ function scanReceiverFrame() {
 async function startReceiver() {
   if (!navigator.mediaDevices?.getUserMedia) {
     setStatus($("receiver-status"), "Este navegador no expone getUserMedia.", true);
+    return;
+  }
+  if (!window.jsQR) {
+    setStatus($("receiver-status"), "No se pudo cargar el decodificador jsQR.", true);
     return;
   }
   try {

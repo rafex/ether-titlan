@@ -6,10 +6,13 @@ use wasm_bindgen::prelude::*;
 
 const HEADER_MAGIC: &[u8; 5] = b"QRF1H";
 const DATA_MAGIC: &[u8; 5] = b"QRF1D";
-const MAX_PACKET_BASE64_BYTES: usize = 1_800;
-// Magic (5) + checksum (8) + index (4). This keeps the Base64 packet below 1,800 bytes.
-const MAX_DATA_BYTES: usize = 1_333;
-const MAX_FILENAME_BYTES: usize = 1_300;
+// A smaller QR payload is considerably easier for a mobile camera to decode.
+// The original 1,800-character limit is valid for transport, but too dense for
+// a practical screen-to-camera distance. 675 raw bytes encode to exactly 900
+// Base64 characters (including the 17-byte data header).
+const MAX_PACKET_BASE64_BYTES: usize = 900;
+const MAX_DATA_BYTES: usize = 658;
+const MAX_FILENAME_BYTES: usize = 255;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct HeaderMetadata {
