@@ -19,7 +19,7 @@ cp "${ROOT_DIR}/frontend/index.html" "${ROOT_DIR}/frontend/main.js" \
 cp -a "${ROOT_DIR}/frontend/vendor" "${ARTIFACT_DIR}/frontend/"
 
 cat >"${ARTIFACT_DIR}/reports/manifest.txt" <<EOF
-qr-light-transfer-local-ci
+tona-transfer-local-ci
 rust=$(rustc --version)
 node=$(node --version)
 python=$(python3 --version)

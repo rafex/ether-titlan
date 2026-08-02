@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_NAME="${IMAGE_NAME:-qr-light-transfer}"
-CONTAINER_NAME="${CONTAINER_NAME:-qr-light-transfer-poc}"
+IMAGE_NAME="${IMAGE_NAME:-tona-transfer}"
+CONTAINER_NAME="${CONTAINER_NAME:-tona-transfer-poc}"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-podman}"
 POC_BIND_IP="${POC_BIND_IP:-192.168.3.175}"
 POC_PORT="${POC_PORT:-30000}"

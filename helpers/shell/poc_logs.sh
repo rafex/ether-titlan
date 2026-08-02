@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONTAINER_NAME="${CONTAINER_NAME:-qr-light-transfer-poc}"
+CONTAINER_NAME="${CONTAINER_NAME:-tona-transfer-poc}"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-podman}"
 
 if [[ -n "${CONTAINER_CONNECTION:-}" ]]; then

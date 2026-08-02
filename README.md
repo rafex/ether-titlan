@@ -1,4 +1,4 @@
-# QR Light Transfer
+# Tōna Transfer
 
 PoC de transferencia de archivos binarios de hasta **1.5 MiB** mediante códigos QR animados. El archivo se transporta ópticamente entre pantalla y cámara; no se envía por el backend.
 
@@ -81,6 +81,6 @@ El acceso inicial a la página usa la red local, pero el archivo no pasa por ell
 
 ## Notas del protocolo
 
-Rust divide el archivo en un paquete de cabecera y paquetes de datos indexados. El receptor tolera orden arbitrario, duplicados y pérdida de fotogramas. Cada paquete Base64 queda por debajo de 900 bytes para facilitar la lectura desde una pantalla, y la cabecera conserva nombre, tamaño, cantidad de paquetes y checksum FNV-1a.
+Rust comprime el archivo con Deflate antes de codificarlo como Base64. Después lo divide en trozos de 1,500 caracteres y genera una cabecera `METADATA|nombre|total|checksum|tamaño`; cada dato se identifica con `DATA|checksum|índice|trozo`. El receptor tolera orden arbitrario, duplicados y pérdida de fotogramas, concatena los trozos, descomprime y valida checksum/tamaño antes de entregar el archivo.
 
-El QR selecciona automáticamente la versión necesaria con corrección `M`, usa un margen de cuatro módulos y repite cada paquete durante varios fotogramas. Una carga de 1,800 caracteres no cabe físicamente en QR versión 5/6; el límite práctico de 900 caracteres mejora la captura con cámaras móviles.
+El QR selecciona automáticamente la versión necesaria con corrección `M`, usa un margen de cuatro módulos y repite cada paquete durante varios fotogramas para mejorar la captura móvil.

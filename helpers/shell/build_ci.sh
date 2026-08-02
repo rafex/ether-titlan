@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-IMAGE_NAME="${CI_IMAGE_NAME:-qr-light-transfer-ci}"
+IMAGE_NAME="${CI_IMAGE_NAME:-tona-transfer-ci}"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-podman}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-${ROOT_DIR}/ci/artifacts}"
 

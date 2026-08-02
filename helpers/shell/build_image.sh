@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-IMAGE_NAME="${IMAGE_NAME:-qr-light-transfer}"
+IMAGE_NAME="${IMAGE_NAME:-tona-transfer}"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-podman}"
 
 if [[ -n "${CONTAINER_CONNECTION:-}" ]]; then

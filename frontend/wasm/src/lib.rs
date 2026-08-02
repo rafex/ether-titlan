@@ -1,24 +1,19 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde::{Deserialize, Serialize};
+use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use wasm_bindgen::prelude::*;
 
-const HEADER_MAGIC: &[u8; 5] = b"QRF1H";
-const DATA_MAGIC: &[u8; 5] = b"QRF1D";
-// A smaller QR payload is considerably easier for a mobile camera to decode.
-// The original 1,800-character limit is valid for transport, but too dense for
-// a practical screen-to-camera distance. 675 raw bytes encode to exactly 900
-// Base64 characters (including the 17-byte data header).
-const MAX_PACKET_BASE64_BYTES: usize = 900;
-const MAX_DATA_BYTES: usize = 658;
+const DATA_CHUNK_CHARS: usize = 1_500;
 const MAX_FILENAME_BYTES: usize = 255;
+const MAX_FILE_BYTES: usize = 1_500 * 1024;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct HeaderMetadata {
     checksum: u64,
-    total_packets: u32,
-    file_size: u64,
+    total_packets: usize,
+    file_size: usize,
     filename: String,
 }
 
@@ -28,8 +23,8 @@ struct ReceiverState {
     total_packets: usize,
     file_size: usize,
     filename: String,
-    packets: Vec<Option<Vec<u8>>>,
-    pending: HashMap<u32, Vec<u8>>,
+    chunks: HashMap<usize, String>,
+    pending: HashMap<usize, String>,
     pending_checksum: Option<u64>,
     received_packets: usize,
     complete: bool,
@@ -40,7 +35,6 @@ thread_local! {
 }
 
 fn checksum(bytes: &[u8], filename: &[u8]) -> u64 {
-    // FNV-1a is used as a lightweight corruption detector for this PoC.
     let mut hash = 0xcbf29ce484222325u64;
     for byte in filename.iter().chain(bytes.iter()) {
         hash ^= u64::from(*byte);
@@ -49,25 +43,50 @@ fn checksum(bytes: &[u8], filename: &[u8]) -> u64 {
     hash
 }
 
-fn read_u16(bytes: &[u8], offset: &mut usize) -> Option<u16> {
-    let end = offset.checked_add(2)?;
-    let value = u16::from_le_bytes(bytes.get(*offset..end)?.try_into().ok()?);
-    *offset = end;
-    Some(value)
+fn compress_file(buffer: &[u8]) -> Option<Vec<u8>> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(6));
+    encoder.write_all(buffer).ok()?;
+    encoder.finish().ok()
 }
 
-fn read_u32(bytes: &[u8], offset: &mut usize) -> Option<u32> {
-    let end = offset.checked_add(4)?;
-    let value = u32::from_le_bytes(bytes.get(*offset..end)?.try_into().ok()?);
-    *offset = end;
-    Some(value)
+fn decompress_file(buffer: &[u8]) -> Option<Vec<u8>> {
+    let mut decoder = DeflateDecoder::new(buffer);
+    let mut output = Vec::new();
+    decoder.read_to_end(&mut output).ok()?;
+    Some(output)
 }
 
-fn read_u64(bytes: &[u8], offset: &mut usize) -> Option<u64> {
-    let end = offset.checked_add(8)?;
-    let value = u64::from_le_bytes(bytes.get(*offset..end)?.try_into().ok()?);
-    *offset = end;
-    Some(value)
+fn parse_checksum(value: &str) -> Option<u64> {
+    u64::from_str_radix(value, 16).ok()
+}
+
+fn parse_header(packet: &str) -> Option<HeaderMetadata> {
+    let fields: Vec<&str> = packet.split('|').collect();
+    if fields.len() != 5 || fields[0] != "METADATA" {
+        return None;
+    }
+
+    let filename = fields[1].to_string();
+    if filename.is_empty()
+        || filename.as_bytes().len() > MAX_FILENAME_BYTES
+        || filename.chars().any(|character| character.is_control())
+    {
+        return None;
+    }
+
+    let total_packets = fields[2].parse::<usize>().ok()?;
+    let checksum = parse_checksum(fields[3])?;
+    let file_size = fields[4].parse::<usize>().ok()?;
+    if total_packets == 0 || file_size > MAX_FILE_BYTES {
+        return None;
+    }
+
+    Some(HeaderMetadata {
+        checksum,
+        total_packets,
+        file_size,
+        filename,
+    })
 }
 
 fn reset_state(state: &mut ReceiverState) {
@@ -79,13 +98,15 @@ fn try_assemble(state: &mut ReceiverState) -> Option<Vec<u8>> {
         return None;
     }
 
-    let mut file = Vec::with_capacity(state.file_size);
-    for packet in &state.packets {
-        file.extend_from_slice(packet.as_ref()?);
+    let mut encoded = String::new();
+    for index in 0..state.total_packets {
+        encoded.push_str(state.chunks.get(&index)?);
     }
 
+    let compressed = STANDARD.decode(encoded).ok()?;
+    let file = decompress_file(&compressed)?;
     if file.len() != state.file_size
-        || checksum(&file, state.filename.as_bytes()) != state.checksum.unwrap()
+        || checksum(&file, state.filename.as_bytes()) != state.checksum?
     {
         return None;
     }
@@ -94,55 +115,74 @@ fn try_assemble(state: &mut ReceiverState) -> Option<Vec<u8>> {
     Some(file)
 }
 
-#[wasm_bindgen]
-pub fn prepare_file(buffer: &[u8], filename: String) -> Vec<String> {
-    let filename_bytes = filename.as_bytes();
-    if filename_bytes.len() > MAX_FILENAME_BYTES {
-        return Vec::new();
-    }
+fn install_header(state: &mut ReceiverState, header: HeaderMetadata) -> Option<Vec<u8>> {
+    let is_new_transfer = state.checksum != Some(header.checksum)
+        || state.total_packets != header.total_packets
+        || state.file_size != header.file_size;
 
-    let total_packets = buffer.len().div_ceil(MAX_DATA_BYTES);
-    if total_packets > u32::MAX as usize || buffer.len() > u64::MAX as usize {
-        return Vec::new();
-    }
+    if is_new_transfer {
+        let pending_checksum = state.pending_checksum;
+        let pending = std::mem::take(&mut state.pending);
+        reset_state(state);
+        state.checksum = Some(header.checksum);
+        state.total_packets = header.total_packets;
+        state.file_size = header.file_size;
+        state.filename = header.filename;
 
-    let file_checksum = checksum(buffer, filename_bytes);
-    let metadata = HeaderMetadata {
-        checksum: file_checksum,
-        total_packets: total_packets as u32,
-        file_size: buffer.len() as u64,
-        filename: filename.clone(),
-    };
-
-    let mut header = Vec::with_capacity(27 + filename_bytes.len());
-    header.extend_from_slice(HEADER_MAGIC);
-    header.extend_from_slice(&metadata.checksum.to_le_bytes());
-    header.extend_from_slice(&metadata.total_packets.to_le_bytes());
-    header.extend_from_slice(&metadata.file_size.to_le_bytes());
-    header.extend_from_slice(&(filename_bytes.len() as u16).to_le_bytes());
-    header.extend_from_slice(filename_bytes);
-
-    let mut packets = Vec::with_capacity(total_packets + 1);
-    let header_packet = STANDARD.encode(header);
-    if header_packet.len() > MAX_PACKET_BASE64_BYTES {
-        return Vec::new();
-    }
-    packets.push(header_packet);
-
-    for (index, chunk) in buffer.chunks(MAX_DATA_BYTES).enumerate() {
-        let mut packet = Vec::with_capacity(17 + chunk.len());
-        packet.extend_from_slice(DATA_MAGIC);
-        packet.extend_from_slice(&file_checksum.to_le_bytes());
-        packet.extend_from_slice(&(index as u32).to_le_bytes());
-        packet.extend_from_slice(chunk);
-        let encoded = STANDARD.encode(packet);
-        if encoded.len() > MAX_PACKET_BASE64_BYTES {
-            return Vec::new();
+        if pending_checksum == Some(header.checksum) {
+            for (index, chunk) in pending {
+                if index < state.total_packets && state.chunks.insert(index, chunk).is_none() {
+                    state.received_packets += 1;
+                }
+            }
         }
-        packets.push(encoded);
+    }
+
+    try_assemble(state)
+}
+
+#[wasm_bindgen]
+pub fn compress_and_split(buffer: Vec<u8>, filename: String) -> Vec<String> {
+    if buffer.len() > MAX_FILE_BYTES
+        || filename.is_empty()
+        || filename.as_bytes().len() > MAX_FILENAME_BYTES
+        || filename
+            .chars()
+            .any(|character| character == '|' || character.is_control())
+    {
+        return Vec::new();
+    }
+
+    let compressed = match compress_file(&buffer) {
+        Some(compressed) => compressed,
+        None => return Vec::new(),
+    };
+    let encoded = STANDARD.encode(compressed);
+    let total_packets = encoded.len().div_ceil(DATA_CHUNK_CHARS);
+    let file_checksum = checksum(&buffer, filename.as_bytes());
+
+    let header = format!(
+        "METADATA|{}|{}|{:016x}|{}",
+        filename,
+        total_packets,
+        file_checksum,
+        buffer.len()
+    );
+    let mut packets = Vec::with_capacity(total_packets + 1);
+    packets.push(header);
+
+    for (index, chunk) in encoded.as_bytes().chunks(DATA_CHUNK_CHARS).enumerate() {
+        let chunk = std::str::from_utf8(chunk).expect("Base64 is always valid UTF-8");
+        packets.push(format!("DATA|{:016x}|{}|{}", file_checksum, index, chunk));
     }
 
     packets
+}
+
+// Backwards-compatible alias for clients built against the previous PoC API.
+#[wasm_bindgen]
+pub fn prepare_file(buffer: &[u8], filename: String) -> Vec<String> {
+    compress_and_split(buffer.to_vec(), filename)
 }
 
 #[wasm_bindgen]
@@ -151,55 +191,25 @@ pub fn reset_receiver() {
 }
 
 #[wasm_bindgen]
-pub fn process_packet(packet_base64: String) -> Option<Vec<u8>> {
-    let packet = STANDARD.decode(packet_base64).ok()?;
-    if packet.len() < 5 {
-        return None;
-    }
-
+pub fn process_packet(packet: String) -> Option<Vec<u8>> {
     RECEIVER.with(|receiver| {
         let state = &mut *receiver.borrow_mut();
 
-        if packet.starts_with(HEADER_MAGIC) {
-            let mut offset = HEADER_MAGIC.len();
-            let checksum_value = read_u64(&packet, &mut offset)?;
-            let total_packets = read_u32(&packet, &mut offset)? as usize;
-            let file_size = usize::try_from(read_u64(&packet, &mut offset)?).ok()?;
-            let filename_len = read_u16(&packet, &mut offset)? as usize;
-            let filename_end = offset.checked_add(filename_len)?;
-            let filename = String::from_utf8(packet.get(offset..filename_end)?.to_vec()).ok()?;
-
-            let is_new_transfer = state.checksum != Some(checksum_value)
-                || state.total_packets != total_packets
-                || state.file_size != file_size;
-            if is_new_transfer {
-                let pending = std::mem::take(&mut state.pending);
-                reset_state(state);
-                state.checksum = Some(checksum_value);
-                state.total_packets = total_packets;
-                state.file_size = file_size;
-                state.filename = filename;
-                state.packets = (0..total_packets).map(|_| None).collect();
-
-                for (index, data) in pending {
-                    if let Some(slot) = state.packets.get_mut(index as usize) {
-                        *slot = Some(data);
-                        state.received_packets += 1;
-                    }
-                }
-            }
-
-            return try_assemble(state);
+        if packet.starts_with("METADATA|") {
+            return install_header(state, parse_header(&packet)?);
         }
 
-        if !packet.starts_with(DATA_MAGIC) {
+        let fields: Vec<&str> = packet.splitn(4, '|').collect();
+        if fields.len() != 4 || fields[0] != "DATA" {
             return None;
         }
 
-        let mut offset = DATA_MAGIC.len();
-        let checksum_value = read_u64(&packet, &mut offset)?;
-        let index = read_u32(&packet, &mut offset)?;
-        let data = packet.get(offset..)?.to_vec();
+        let checksum_value = parse_checksum(fields[1])?;
+        let index = fields[2].parse::<usize>().ok()?;
+        let chunk = fields[3];
+        if chunk.is_empty() || chunk.len() > DATA_CHUNK_CHARS {
+            return None;
+        }
 
         if state.checksum != Some(checksum_value) {
             if state.checksum.is_none() {
@@ -207,16 +217,16 @@ pub fn process_packet(packet_base64: String) -> Option<Vec<u8>> {
                     state.pending.clear();
                     state.pending_checksum = Some(checksum_value);
                 }
-                state.pending.entry(index).or_insert(data);
+                state
+                    .pending
+                    .entry(index)
+                    .or_insert_with(|| chunk.to_string());
             }
             return None;
         }
 
-        if let Some(slot) = state.packets.get_mut(index as usize) {
-            if slot.is_none() {
-                *slot = Some(data);
-                state.received_packets += 1;
-            }
+        if index < state.total_packets && state.chunks.insert(index, chunk.to_string()).is_none() {
+            state.received_packets += 1;
         }
 
         try_assemble(state)
@@ -241,37 +251,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trip_allows_out_of_order_packets() {
+    fn compressed_round_trip_allows_out_of_order_packets() {
         let input: Vec<u8> = (0..10_000).map(|value| (value % 251) as u8).collect();
-        let packets = prepare_file(&input, "foto.bin".to_string());
-        assert!(
-            packets
-                .iter()
-                .all(|packet| packet.len() <= MAX_PACKET_BASE64_BYTES)
-        );
+        let packets = compress_and_split(input.clone(), "foto.bin".to_string());
 
         reset_receiver();
         for packet in packets.iter().skip(1).rev() {
             assert!(process_packet(packet.clone()).is_none());
         }
-        let output = process_packet(packets[0].clone()).expect("header completes transfer");
+        let output = process_packet(packets[0].clone()).expect("transfer should complete");
         assert_eq!(output, input);
         assert_eq!(receiver_filename(), "foto.bin");
         assert_eq!(
             receiver_progress().to_vec(),
-            vec![packets.len() as u32 - 1, packets.len() as u32 - 1]
+            vec![packets.len() as u32 - 1; 2]
         );
     }
 
     #[test]
     fn duplicate_packets_are_ignored() {
-        let input = vec![42u8; MAX_DATA_BYTES + 5];
-        let packets = prepare_file(&input, "repetido.dat".to_string());
+        let mut seed = 0x1234_5678u32;
+        let input: Vec<u8> = (0..5_000)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let packets = compress_and_split(input.clone(), "repetido.dat".to_string());
         reset_receiver();
         assert!(process_packet(packets[0].clone()).is_none());
         assert!(process_packet(packets[1].clone()).is_none());
         assert!(process_packet(packets[1].clone()).is_none());
-        let output = process_packet(packets[2].clone()).expect("all data packets received");
+        let mut output = None;
+        for packet in packets.iter().skip(2) {
+            output = process_packet(packet.clone());
+        }
+        let output = output.expect("all data packets received");
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn data_packets_can_arrive_before_metadata() {
+        let input = vec![7u8; 2_000];
+        let packets = compress_and_split(input.clone(), "antes.bin".to_string());
+        reset_receiver();
+        for packet in packets.iter().skip(1) {
+            assert!(process_packet(packet.clone()).is_none());
+        }
+        let output = process_packet(packets[0].clone()).expect("pending data should attach");
         assert_eq!(output, input);
     }
 }

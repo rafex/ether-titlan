@@ -1,5 +1,5 @@
 import init, {
-  prepare_file,
+  compress_and_split,
   process_packet,
   receiver_filename,
   receiver_progress,
@@ -131,7 +131,7 @@ async function loadFile(file) {
 
   try {
     const buffer = await file.arrayBuffer();
-    sender.packets = prepare_file(new Uint8Array(buffer), file.name);
+    sender.packets = compress_and_split(new Uint8Array(buffer), file.name);
     if (!sender.packets.length) throw new Error("WASM rechazó el archivo o el nombre es demasiado largo.");
     sender.file = file;
     $("start-sender").disabled = false;

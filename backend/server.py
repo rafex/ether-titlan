@@ -21,7 +21,7 @@ class BackendHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "service": "python-backend", "transport": "optical"})
             return
         if self.path == "/api/info":
-            self._send_json(200, {"name": "QR Light Transfer", "file_transfer": "wasm-and-camera"})
+            self._send_json(200, {"name": "Tōna Transfer", "file_transfer": "wasm-and-camera"})
             return
         self._send_json(404, {"error": "not_found"})
 
@@ -35,7 +35,7 @@ class BackendHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="QR Light Transfer Python backend")
+    parser = argparse.ArgumentParser(description="Tōna Transfer Python backend")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
     args = parser.parse_args()
