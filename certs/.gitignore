@@ -1,0 +1,3 @@
+# Never commit local TLS material. The container generates certificates at startup.
+*
+!.gitignore

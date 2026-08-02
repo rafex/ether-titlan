@@ -1,0 +1,57 @@
+# Rust/WASM build artifacts
+/target/
+/pkg/
+/frontend/pkg/
+frontend/wasm/target/
+*.rlib
+*.rmeta
+*.wasm
+
+# JavaScript/Node tooling
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.parcel-cache/
+.vite/
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+/certs/*
+!/certs/.gitignore
+/runtime/*
+!/runtime/.gitignore
+
+# Logs, temporary files and local reports
+*.log
+*.pid
+*.tmp
+*.swp
+.cache/
+
+# Editors and operating systems
+.DS_Store
+.AppleDouble
+.LSOverride
+.idea/
+.vscode/

@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#101827" />
+    <title>QR Light Transfer</title>
+    <style>
+      :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; background: #0b1020; color: #edf2f7; }
+      main { width: min(960px, 100%); margin: 0 auto; padding: 24px 16px 48px; }
+      h1 { margin: 0 0 8px; font-size: clamp(1.5rem, 4vw, 2.25rem); }
+      h2 { margin-top: 0; }
+      .subtitle, .hint { color: #a7b4c9; }
+      .tabs { display: flex; gap: 8px; margin: 24px 0 16px; }
+      button, .file-label { border: 0; border-radius: 10px; padding: 11px 16px; background: #2d6cdf; color: white; font: inherit; cursor: pointer; }
+      button.secondary, .file-label { background: #26344e; }
+      button:disabled { cursor: not-allowed; opacity: .5; }
+      .tab[aria-selected="true"] { background: #36b37e; }
+      .panel { display: none; padding: 18px; border: 1px solid #26344e; border-radius: 16px; background: #111a2d; }
+      .panel.active { display: block; }
+      .drop-zone { border: 2px dashed #50678f; border-radius: 14px; padding: 34px 18px; text-align: center; transition: border-color .2s, background .2s; }
+      .drop-zone.dragover { border-color: #36b37e; background: #172b38; }
+      .actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0; }
+      .status { min-height: 1.5em; color: #b8c5d9; }
+      .error { color: #ff9b9b; }
+      .progress-wrap { margin: 16px 0; }
+      progress { width: 100%; height: 12px; accent-color: #36b37e; }
+      #sender-canvas { display: block; width: min(80vw, 640px); height: min(80vw, 640px); margin: 18px auto 4px; background: white; image-rendering: pixelated; }
+      #receiver-video { display: block; width: min(100%, 560px); max-height: 55vh; margin: 16px auto; border-radius: 12px; background: #05070c; object-fit: cover; }
+      .small { font-size: .9rem; }
+      code { color: #bfe3ff; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>QR Light Transfer</h1>
+      <p class="subtitle">Transfiere archivos binarios usando la luz de la pantalla, sin Wi‑Fi, Bluetooth ni Internet.</p>
+      <p id="backend-status" class="hint small">Comprobando backend Python…</p>
+
+      <nav class="tabs" aria-label="Modo de transferencia">
+        <button class="tab" data-tab="sender" aria-selected="true">Emisor</button>
+        <button class="tab secondary" data-tab="receiver" aria-selected="false">Receptor</button>
+      </nav>
+
+      <section id="sender-panel" class="panel active" aria-labelledby="sender-tab">
+        <h2>Emisor</h2>
+        <div id="drop-zone" class="drop-zone">
+          <p>Arrastra un archivo aquí o selecciónalo.</p>
+          <label class="file-label" for="file-input">Seleccionar archivo</label>
+          <input id="file-input" type="file" hidden />
+          <p class="hint small">Límite de la PoC: 1.5 MiB.</p>
+        </div>
+        <div class="actions">
+          <button id="start-sender" disabled>Iniciar emisión</button>
+          <button id="stop-sender" class="secondary" disabled>Detener</button>
+        </div>
+        <p id="sender-file" class="status">Ningún archivo seleccionado.</p>
+        <div class="progress-wrap">
+          <progress id="sender-progress" value="0" max="1"></progress>
+          <p id="sender-progress-label" class="small">Paquete 0 de 0</p>
+        </div>
+        <canvas id="sender-canvas" width="640" height="640" aria-label="Código QR emitido"></canvas>
+      </section>
+
+      <section id="receiver-panel" class="panel" aria-labelledby="receiver-tab">
+        <h2>Receptor</h2>
+        <p class="hint small">Acepta el certificado autofirmado del servidor y apunta la cámara al QR del emisor.</p>
+        <div class="actions">
+          <button id="start-receiver">Activar cámara</button>
+          <button id="stop-receiver" class="secondary" disabled>Detener cámara</button>
+        </div>
+        <video id="receiver-video" autoplay playsinline muted></video>
+        <canvas id="scan-canvas" hidden></canvas>
+        <p id="receiver-status" class="status">Cámara inactiva.</p>
+        <div class="progress-wrap">
+          <progress id="receiver-progress" value="0" max="1"></progress>
+          <p id="receiver-progress-label" class="small">Paquetes recibidos: 0 de 0</p>
+        </div>
+        <a id="download-link" hidden></a>
+      </section>
+    </main>
+
+    <script src="./vendor/qrcode.min.js"></script>
+    <script src="./vendor/jsQR.js"></script>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
