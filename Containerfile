@@ -1,6 +1,6 @@
-FROM rust:1.85-bookworm AS wasm-builder
+FROM rust:1.91-bookworm AS wasm-builder
 
-RUN cargo install wasm-pack --version 0.13.1 --locked
+RUN cargo install wasm-pack --version 0.15.0 --locked
 WORKDIR /build/frontend/wasm
 COPY frontend/wasm/Cargo.toml ./
 COPY frontend/wasm/Cargo.lock ./

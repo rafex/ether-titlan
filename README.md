@@ -59,7 +59,7 @@ cd frontend/wasm
 wasm-pack build --target web --release --out-dir ../pkg
 ```
 
-Requisitos locales: Rust 1.85+, `wasm-pack`, Node.js 20+, npm, Python 3, OpenSSL, Make y Just.
+Requisitos locales: Rust 1.91+, `wasm-pack 0.15.0`, Node.js 20+, npm, Python 3, OpenSSL, Make y Just.
 
 `make ci` construye un contenedor CI aislado, ejecuta `cargo fmt`, `cargo test`, `wasm-pack`, las validaciones Node/Python y deja los artefactos en `ci/artifacts/`. No requiere instalar Rust, Node o Python para ejecutar el CI en el host.
 

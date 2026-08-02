@@ -15,7 +15,7 @@ check: frontend-check backend-check
 
 build: wasm check
 
-container: build
+container:
 	@$(ROOT_DIR)/helpers/shell/build_image.sh
 
 ci:
