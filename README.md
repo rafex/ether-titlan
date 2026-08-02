@@ -71,10 +71,11 @@ El `Containerfile` compila Rust/WASM en una etapa y ejecuta Node.js + Python en 
 CONTAINER_CONNECTION=podman-machine-default make container
 
 POC_BIND_IP=192.168.3.175 \
+POC_PORT=30000 \
 CONTAINER_CONNECTION=podman-machine-default just poc-up
 ```
 
-La tarea publica únicamente `192.168.3.175:8443/tcp`, permitido por UFW. Abre `https://192.168.3.175:8443` en el celular, acepta el certificado autofirmado y selecciona **Receptor**. En la computadora selecciona **Emisor**, carga el archivo e inicia la emisión. Para otra interfaz, sobrescribe `POC_BIND_IP` y `CERT_ALT_NAME`.
+La tarea publica `192.168.3.175:30000/tcp` hacia el HTTPS interno del contenedor (`8443/tcp`), dentro del rango permitido por UFW. Abre `https://192.168.3.175:30000` en el celular, acepta el certificado autofirmado y selecciona **Receptor**. En la computadora selecciona **Emisor**, carga el archivo e inicia la emisión. Para otra interfaz o puerto del rango `30000:30099`, sobrescribe `POC_BIND_IP`, `POC_PORT` y `CERT_ALT_NAME`.
 
 El acceso inicial a la página usa la red local, pero el archivo no pasa por ella: la transferencia se realiza mediante luz, Canvas y cámara.
 
