@@ -511,16 +511,29 @@ function scanSenderControlFrame() {
 }
 
 async function startSenderControl() {
+  if (!window.isSecureContext && !["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname)) {
+    setStatus($("sender-file"), "La webcam requiere HTTPS. Abre https://IP_DE_LA_PC:30000 y acepta el certificado.", true);
+    return;
+  }
   if (!navigator.mediaDevices?.getUserMedia) {
     setStatus($("sender-file"), "Este navegador no expone getUserMedia para leer faltantes.", true);
     return;
   }
   try {
     senderControl.lastRequest = "";
-    senderControl.stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: { facingMode: { ideal: "environment" }, width: { ideal: 800 }, height: { ideal: 600 } },
-    });
+    try {
+      senderControl.stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 800 }, height: { ideal: 600 } },
+      });
+    } catch (error) {
+      if (!["OverconstrainedError", "NotFoundError", "NotReadableError"].includes(error.name)) throw error;
+      receiverLog("Configuración preferida rechazada en lector de solicitudes; probando webcam genérica", {
+        name: error.name,
+        message: error.message,
+      });
+      senderControl.stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+    }
     const video = $("sender-control-video");
     video.hidden = false;
     video.srcObject = senderControl.stream;
@@ -532,7 +545,7 @@ async function startSenderControl() {
     scanSenderControlFrame();
   } catch (error) {
     stopSenderControl();
-    setStatus($("sender-file"), `No se pudo activar el lector de solicitudes: ${error.message}`, true);
+    setStatus($("sender-file"), `No se pudo activar el lector de solicitudes: ${describeCameraError(error)}`, true);
   }
 }
 
@@ -553,6 +566,73 @@ function stopReceiver() {
   $("start-receiver").disabled = false;
   $("stop-receiver").disabled = true;
   receiverLog("Cámara detenida");
+}
+
+function receiverCameraConstraints() {
+  const deviceId = $("receiver-camera-select")?.value;
+  const video = {
+    width: { ideal: 1280 },
+    height: { ideal: 720 },
+    frameRate: { ideal: 30, max: 60 },
+  };
+  if (deviceId) video.deviceId = { exact: deviceId };
+  else video.facingMode = { ideal: "environment" };
+  return { audio: false, video };
+}
+
+async function refreshReceiverCameras() {
+  if (!navigator.mediaDevices?.enumerateDevices) return;
+  const select = $("receiver-camera-select");
+  if (!select) return;
+  const selected = select.value;
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cameras = devices.filter((device) => device.kind === "videoinput");
+  select.replaceChildren(new Option("Seleccionar automáticamente", ""));
+  cameras.forEach((camera, index) => {
+    const label = camera.label || `Webcam ${index + 1}`;
+    select.append(new Option(label, camera.deviceId));
+  });
+  if (cameras.some((camera) => camera.deviceId === selected)) select.value = selected;
+  receiverLog("Webcams disponibles", { count: cameras.length, labels: cameras.map((camera) => camera.label || "sin etiqueta") });
+}
+
+async function openReceiverCamera() {
+  const preferred = receiverCameraConstraints();
+  try {
+    return await navigator.mediaDevices.getUserMedia(preferred);
+  } catch (error) {
+    const recoverable = ["OverconstrainedError", "NotFoundError", "NotReadableError"].includes(error.name);
+    if (!recoverable) throw error;
+    receiverLog("Configuración preferida rechazada; probando webcam genérica", {
+      name: error.name,
+      message: error.message,
+    });
+    return navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+  }
+}
+
+async function waitForVideoMetadata(video) {
+  if (video.readyState >= HTMLMediaElement.HAVE_METADATA && video.videoWidth > 0) return;
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("La webcam no entregó dimensiones de vídeo")), 5000);
+    video.addEventListener("loadedmetadata", () => {
+      clearTimeout(timeout);
+      resolve();
+    }, { once: true });
+  });
+}
+
+function describeCameraError(error) {
+  const reasons = {
+    NotAllowedError: "permiso denegado; habilita la webcam para este sitio",
+    NotFoundError: "no se encontró ninguna webcam disponible",
+    NotReadableError: "la webcam está siendo usada por otra aplicación o el sistema la bloqueó",
+    OverconstrainedError: "la webcam no admite la configuración solicitada",
+    SecurityError: "el navegador bloqueó la cámara por seguridad; usa HTTPS",
+  };
+  return reasons[error?.name]
+    ? `${reasons[error.name]} (${error.name})`
+    : `${error?.message || error} (${error?.name || "Error"})`;
 }
 
 function finishDownload(bytes) {
@@ -712,6 +792,19 @@ function scanReceiverFrame() {
 }
 
 async function startReceiver() {
+  receiver.logLines = [];
+  receiver.stats = { frames: 0, qrDetections: 0, duplicates: 0, packets: 0 };
+  receiverLog("Entorno de cámara", {
+    secureContext: window.isSecureContext,
+    protocol: window.location.protocol,
+    host: window.location.host,
+    userAgent: navigator.userAgent,
+  });
+  if (!window.isSecureContext && !["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname)) {
+    setStatus($("receiver-status"), "La webcam requiere HTTPS. Abre https://IP_DE_LA_PC:30000 y acepta el certificado.", true);
+    receiverLog("Contexto inseguro: getUserMedia bloqueado por el navegador");
+    return;
+  }
   if (!navigator.mediaDevices?.getUserMedia) {
     setStatus($("receiver-status"), "Este navegador no expone getUserMedia.", true);
     return;
@@ -721,8 +814,6 @@ async function startReceiver() {
     return;
   }
   try {
-    receiver.logLines = [];
-    receiver.stats = { frames: 0, qrDetections: 0, duplicates: 0, packets: 0 };
     receiver.roi = null;
     receiver.roiMisses = 0;
     receiver.frameKind = null;
@@ -731,18 +822,16 @@ async function startReceiver() {
     reset_binary_receiver();
     receiver.lastPacket = "";
     updateReceiverProgress();
-    receiver.stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        facingMode: { ideal: "environment" },
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-        frameRate: { ideal: 30, max: 60 },
-      },
-    });
+    receiver.stream = await openReceiverCamera();
     const video = $("receiver-video");
     video.srcObject = receiver.stream;
     await video.play();
+    await waitForVideoMetadata(video);
+    try {
+      await refreshReceiverCameras();
+    } catch (error) {
+      receiverLog("No se pudo enumerar webcams; se conserva la cámara activa", { message: error.message });
+    }
     const track = receiver.stream.getVideoTracks()[0];
     const settings = track?.getSettings?.() || {};
     const capabilities = track?.getCapabilities?.() || {};
@@ -769,7 +858,8 @@ async function startReceiver() {
     scheduleReceiverFrame();
   } catch (error) {
     stopReceiver();
-    setStatus($("receiver-status"), `No se pudo activar la cámara: ${error.message}`, true);
+    receiverLog("Error de cámara", { name: error.name, message: error.message });
+    setStatus($("receiver-status"), `No se pudo activar la cámara: ${describeCameraError(error)}`, true);
   }
 }
 

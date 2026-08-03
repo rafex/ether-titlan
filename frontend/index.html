@@ -37,6 +37,7 @@
       progress { width: 100%; height: 12px; accent-color: #36b37e; }
       #sender-canvas { display: block; width: min(80vw, 640px); height: min(80vw, 640px); margin: 18px auto 4px; background: white; image-rendering: pixelated; }
       #receiver-video { display: block; width: min(100%, 560px); max-height: 55vh; margin: 16px auto; border-radius: 12px; background: #05070c; object-fit: cover; }
+      #receiver-camera-select { display: block; width: 100%; margin-top: 6px; border: 1px solid #50678f; border-radius: 8px; padding: 8px 10px; background: #0b1020; color: #edf2f7; font: inherit; }
       #sender-control-video { display: block; width: min(100%, 360px); max-height: 28vh; margin: 12px auto; border-radius: 10px; background: #05070c; object-fit: cover; }
       .packet-map { display: block; width: 100%; height: 52px; margin: 8px 0; border: 1px solid #26344e; border-radius: 8px; background: #080d18; image-rendering: pixelated; }
       #receiver-control-canvas { display: block; width: min(70vw, 320px); height: min(70vw, 320px); margin: 12px auto; background: white; image-rendering: pixelated; }
@@ -123,6 +124,11 @@
       <section id="receiver-panel" class="panel" aria-labelledby="receiver-tab">
         <h2>Receptor</h2>
         <p class="hint small">Acepta el certificado autofirmado del servidor y apunta la cámara al QR del emisor.</p>
+        <label for="receiver-camera-select" class="meta small">Webcam
+          <select id="receiver-camera-select" aria-label="Seleccionar webcam">
+            <option value="">Seleccionar automáticamente</option>
+          </select>
+        </label>
         <div class="actions">
           <button id="start-receiver">Activar cámara</button>
           <button id="stop-receiver" class="secondary" disabled>Detener cámara</button>

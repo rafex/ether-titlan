@@ -106,3 +106,15 @@ Para esta arquitectura hay dos caminos sólidos:
 La solución actual conserva la primera alternativa porque es verificable para archivos de hasta 1.5 MiB y permite mostrar exactamente qué paquetes faltan. El contador de tiempo es informativo y se inicia al comenzar la emisión o al activar la cámara.
 
 Las optimizaciones de transporte binario, FEC, compresión adaptativa, repetición adaptativa, ROI y `requestVideoFrameCallback` están descritas en [docs/TRANSFER-OPTIMIZATION.md](docs/TRANSFER-OPTIMIZATION.md).
+
+### Webcam en computadora
+
+Para usar una webcam de escritorio, abre la dirección HTTPS completa, no una URL HTTP:
+
+```text
+https://192.168.3.175:30000
+```
+
+Acepta el certificado autofirmado y después pulsa **Activar cámara**. El receptor muestra las webcams disponibles después de conceder el permiso y permite seleccionar una explícitamente. Si la configuración orientada a móvil no es compatible con el dispositivo, el frontend reintenta con `video: true`.
+
+Si el navegador indica que `getUserMedia` no está disponible, revisa el panel **Diagnóstico del receptor**: una URL `http://192.168.3.175:30000` no es un contexto seguro y el navegador bloqueará la webcam. También verifica que otra aplicación no esté usando exclusivamente la cámara.
