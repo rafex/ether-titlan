@@ -83,4 +83,24 @@ El acceso inicial a la página usa la red local, pero el archivo no pasa por ell
 
 Rust comprime el archivo con Deflate antes de codificarlo como Base64. Después lo divide en trozos configurables desde el frontend (`300–1500` caracteres; `600` por defecto) y genera una cabecera `METADATA|nombre|total|checksum|tamaño`; cada dato se identifica con `DATA|checksum|índice|trozo`. El receptor tolera orden arbitrario, duplicados y pérdida de fotogramas, concatena los trozos, descomprime y valida checksum/tamaño antes de entregar el archivo.
 
-El QR selecciona automáticamente la versión necesaria con corrección `L` o `M`, usa un margen de cuatro módulos y repite cada paquete durante varios fotogramas para mejorar la captura móvil. La densidad se puede ajustar en la pestaña **Emisor** sin recompilar.
+El QR selecciona automáticamente la versión necesaria con corrección `L` o `M`, usa un margen de cuatro módulos y repite cada paquete durante varios fotogramas para mejorar la captura móvil. La densidad se puede ajustar en la pestaña **Emisor** sin recompilar. La cabecera se emite al inicio, mitad y final de cada ciclo para que el receptor pueda incorporarse tarde o recuperar metadatos.
+
+El receptor expone el nombre y extensión, tamaño, checksum, contador transcurrido y un mapa visual de paquetes: verde significa recibido y rojo faltante. También genera una solicitud óptica `REQUEST|checksum|rangos`; el emisor puede leerla con **Leer solicitud del receptor** y reconstruir su cola para retransmitir solamente esos índices. Si la solicitud no cabe en un QR, se puede escribir el mismo rango manualmente, por ejemplo `0-3,8,10-12`.
+
+### Compresión y retransmisión
+
+No se comprime Base64 por paquete. Base64 añade aproximadamente 33% de tamaño y al convertir primero el binario a texto se pierde parte de la redundancia que Deflate puede aprovechar. La implementación comprime el binario completo una vez, codifica el flujo comprimido y después lo divide; así sólo se descomprime cuando todos los índices están disponibles y el checksum evita aceptar una reconstrucción corrupta.
+
+La propuesta de comprimir cada trozo con gzip/LZMA/XZ tiene estas desventajas para esta PoC:
+
+- Cada trozo independiente repite cabeceras y suele comprimir peor.
+- Gzip/Deflate por trozo aumenta el número de estados y paquetes de control.
+- LZMA/XZ puede mejorar la ratio en texto repetitivo, pero eleva el tamaño del WASM, CPU, memoria y latencia móvil.
+- Imágenes JPEG, ZIP, PDF comprimidos o datos cifrados pueden no reducirse más.
+
+Para esta arquitectura hay dos caminos sólidos:
+
+1. **Índices + bitmap + NACK óptico (implementado):** un flujo Deflate único, paquetes indexados, mapa de faltantes y un QR de solicitud que viaja de vuelta desde el receptor al emisor. Es sencillo de inspeccionar, permite reanudar y retransmite sólo lo perdido, pero requiere que el emisor tenga cámara y que ambos dispositivos puedan apuntarse alternativamente.
+2. **Fountain/Raptor simplificado (siguiente evolución):** el emisor transmite combinaciones XOR de bloques con una semilla; el receptor reconstruye cuando obtiene suficientes combinaciones independientes, sin canal de retorno. Tolera mejor pérdidas y movimiento, pero requiere más protocolo, memoria y pruebas matemáticas; ya no se puede mostrar un índice recibido de forma tan directa.
+
+La solución actual conserva la primera alternativa porque es verificable para archivos de hasta 1.5 MiB y permite mostrar exactamente qué paquetes faltan. El contador de tiempo es informativo y se inicia al comenzar la emisión o al activar la cámara.

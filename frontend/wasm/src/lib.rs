@@ -1,5 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
+use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -12,6 +13,7 @@ const MIN_DATA_CHUNK_CHARS: usize = 300;
 const MAX_DATA_CHUNK_CHARS: usize = 1_500;
 const MAX_FILENAME_BYTES: usize = 255;
 const MAX_FILE_BYTES: usize = 1_500 * 1024;
+const MAX_TOTAL_PACKETS: usize = MAX_FILE_BYTES / MIN_DATA_CHUNK_CHARS + 2;
 
 #[derive(Clone, Debug)]
 struct HeaderMetadata {
@@ -31,6 +33,17 @@ struct ReceiverState {
     pending: HashMap<usize, String>,
     pending_checksum: Option<u64>,
     received_packets: usize,
+    complete: bool,
+}
+
+#[derive(Serialize)]
+struct ReceiverInfo {
+    filename: String,
+    total_packets: usize,
+    file_size: usize,
+    checksum: Option<String>,
+    received_packets: usize,
+    missing_packets: usize,
     complete: bool,
 }
 
@@ -81,7 +94,7 @@ fn parse_header(packet: &str) -> Option<HeaderMetadata> {
     let total_packets = fields[2].parse::<usize>().ok()?;
     let checksum = parse_checksum(fields[3])?;
     let file_size = fields[4].parse::<usize>().ok()?;
-    if total_packets == 0 || file_size > MAX_FILE_BYTES {
+    if total_packets == 0 || total_packets > MAX_TOTAL_PACKETS || file_size > MAX_FILE_BYTES {
         return None;
     }
 
@@ -264,6 +277,73 @@ pub fn receiver_filename() -> String {
     RECEIVER.with(|receiver| receiver.borrow().filename.clone())
 }
 
+fn missing_ranges(state: &ReceiverState) -> String {
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < state.total_packets {
+        if state.chunks.contains_key(&index) {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < state.total_packets && !state.chunks.contains_key(&index) {
+            index += 1;
+        }
+        let end = index - 1;
+        if start == end {
+            ranges.push(start.to_string());
+        } else {
+            ranges.push(format!("{start}-{end}"));
+        }
+    }
+    ranges.join(",")
+}
+
+#[wasm_bindgen]
+pub fn receiver_info() -> String {
+    RECEIVER.with(|receiver| {
+        let state = receiver.borrow();
+        let missing_packets = state.total_packets.saturating_sub(state.received_packets);
+        let info = ReceiverInfo {
+            filename: state.filename.clone(),
+            total_packets: state.total_packets,
+            file_size: state.file_size,
+            checksum: state.checksum.map(|value| format!("{value:016x}")),
+            received_packets: state.received_packets,
+            missing_packets,
+            complete: state.complete,
+        };
+        serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string())
+    })
+}
+
+#[wasm_bindgen]
+pub fn receiver_packet_map() -> Vec<u8> {
+    RECEIVER.with(|receiver| {
+        let state = receiver.borrow();
+        (0..state.total_packets)
+            .map(|index| u8::from(state.chunks.contains_key(&index)))
+            .collect()
+    })
+}
+
+#[wasm_bindgen]
+pub fn receiver_missing_ranges() -> String {
+    RECEIVER.with(|receiver| missing_ranges(&receiver.borrow()))
+}
+
+#[wasm_bindgen]
+pub fn receiver_control_packet() -> String {
+    RECEIVER.with(|receiver| {
+        let state = receiver.borrow();
+        let Some(checksum) = state.checksum else {
+            return String::new();
+        };
+        format!("REQUEST|{checksum:016x}|{}", missing_ranges(&state))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +401,29 @@ mod tests {
         }
         let output = process_packet(packets[0].clone()).expect("pending data should attach");
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn receiver_exposes_metadata_map_and_missing_ranges() {
+        let mut seed = 0x9e37_79b9u32;
+        let input: Vec<u8> = (0..12_000)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let packets = compress_and_split_with_chunk_size(input, "imagen.tar.gz".to_string(), 300);
+        reset_receiver();
+        process_packet(packets[0].clone());
+        process_packet(packets[1].clone());
+        process_packet(packets[3].clone());
+
+        let map = receiver_packet_map();
+        assert_eq!(map[0], 1);
+        assert_eq!(map[1], 0);
+        assert_eq!(map[2], 1);
+        assert!(receiver_missing_ranges().contains('1'));
+        assert!(receiver_control_packet().starts_with("REQUEST|"));
+        assert!(receiver_info().contains("imagen.tar.gz"));
     }
 }

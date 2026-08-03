@@ -26,12 +26,22 @@
       .qr-settings { display: grid; gap: 8px; margin: 16px 0; padding: 12px; border: 1px solid #26344e; border-radius: 10px; }
       .qr-settings label { display: flex; justify-content: space-between; gap: 12px; color: #c9d5e8; }
       .qr-settings input[type="range"] { width: 100%; accent-color: #36b37e; }
+      .qr-settings select, .missing-input { border: 1px solid #50678f; border-radius: 8px; padding: 8px 10px; background: #0b1020; color: #edf2f7; font: inherit; }
+      .missing-settings { display: grid; gap: 8px; margin: 16px 0; padding: 12px; border: 1px solid #26344e; border-radius: 10px; }
+      .missing-settings label { color: #c9d5e8; }
+      .missing-row { display: flex; flex-wrap: wrap; gap: 8px; }
+      .missing-row .missing-input { flex: 1 1 240px; min-width: 0; }
       .status { min-height: 1.5em; color: #b8c5d9; }
       .error { color: #ff9b9b; }
       .progress-wrap { margin: 16px 0; }
       progress { width: 100%; height: 12px; accent-color: #36b37e; }
       #sender-canvas { display: block; width: min(80vw, 640px); height: min(80vw, 640px); margin: 18px auto 4px; background: white; image-rendering: pixelated; }
       #receiver-video { display: block; width: min(100%, 560px); max-height: 55vh; margin: 16px auto; border-radius: 12px; background: #05070c; object-fit: cover; }
+      #sender-control-video { display: block; width: min(100%, 360px); max-height: 28vh; margin: 12px auto; border-radius: 10px; background: #05070c; object-fit: cover; }
+      .packet-map { display: block; width: 100%; height: 52px; margin: 8px 0; border: 1px solid #26344e; border-radius: 8px; background: #080d18; image-rendering: pixelated; }
+      #receiver-control-canvas { display: block; width: min(70vw, 320px); height: min(70vw, 320px); margin: 12px auto; background: white; image-rendering: pixelated; }
+      .meta { color: #c9d5e8; margin: 8px 0; }
+      time { font-variant-numeric: tabular-nums; color: #bfe3ff; }
       .diagnostics { margin-top: 16px; color: #a7b4c9; }
       .diagnostics summary { cursor: pointer; }
       .diagnostics pre { max-height: 180px; overflow: auto; padding: 10px; border-radius: 8px; background: #080d18; color: #bfe3ff; font: .75rem ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
@@ -62,6 +72,21 @@
           <button id="start-sender" disabled>Iniciar emisión</button>
           <button id="stop-sender" class="secondary" disabled>Detener</button>
         </div>
+        <div class="missing-settings">
+          <label for="sender-missing-ranges">Retransmitir sólo paquetes faltantes</label>
+          <div class="missing-row">
+            <input id="sender-missing-ranges" class="missing-input" type="text" placeholder="Ej.: 0-3,8,10-12" autocomplete="off" />
+            <button id="apply-missing" class="secondary" type="button">Aplicar faltantes</button>
+            <button id="clear-missing" class="secondary" type="button">Enviar todos</button>
+          </div>
+          <p class="hint small">Los índices son los paquetes de datos, empezando en 0. También puedes activar la cámara para leer la solicitud QR del receptor.</p>
+          <div class="actions">
+            <button id="start-sender-control" class="secondary" type="button">Leer solicitud del receptor</button>
+            <button id="stop-sender-control" class="secondary" type="button" disabled>Detener lector</button>
+          </div>
+          <video id="sender-control-video" autoplay playsinline muted hidden></video>
+          <canvas id="sender-control-scan-canvas" hidden></canvas>
+        </div>
         <div class="qr-settings">
           <label for="qr-chunk-size"><span>Densidad del QR</span><output id="qr-settings-label">600 caracteres por paquete</output></label>
           <input id="qr-chunk-size" type="range" min="300" max="1500" step="100" value="600" />
@@ -74,6 +99,7 @@
           <p class="hint small">Valores bajos generan QR más legibles; cambiar el control reprocesa el archivo sin recompilar WASM.</p>
         </div>
         <p id="sender-file" class="status">Ningún archivo seleccionado.</p>
+        <p id="sender-packet-meta" class="meta small">Paquetes: 0 · tiempo: <time id="sender-elapsed">00:00</time></p>
         <div class="progress-wrap">
           <progress id="sender-progress" value="0" max="1"></progress>
           <p id="sender-progress-label" class="small">Paquete 0 de 0</p>
@@ -91,10 +117,20 @@
         <video id="receiver-video" autoplay playsinline muted></video>
         <canvas id="scan-canvas" hidden></canvas>
         <p id="receiver-status" class="status">Cámara inactiva.</p>
+        <p id="receiver-file-meta" class="meta small">Archivo: pendiente de cabecera.</p>
         <div class="progress-wrap">
           <progress id="receiver-progress" value="0" max="1"></progress>
           <p id="receiver-progress-label" class="small">Paquetes recibidos: 0 de 0</p>
         </div>
+        <p id="receiver-missing-label" class="meta small">Faltantes: —</p>
+        <canvas id="receiver-packet-map" class="packet-map" width="720" height="52" aria-label="Mapa de paquetes recibidos y faltantes"></canvas>
+        <details class="missing-settings">
+          <summary>Solicitud óptica de retransmisión</summary>
+          <p class="hint small">Apunta la cámara del emisor a este QR para que envíe sólo los paquetes faltantes.</p>
+          <canvas id="receiver-control-canvas" width="320" height="320" aria-label="Solicitud QR de paquetes faltantes"></canvas>
+          <p id="receiver-control-status" class="status small">Aún no hay una cabecera recibida.</p>
+        </details>
+        <p class="meta small">Tiempo: <time id="receiver-elapsed">00:00</time></p>
         <details class="diagnostics">
           <summary>Diagnóstico del receptor</summary>
           <pre id="receiver-debug">Sin iniciar.</pre>
