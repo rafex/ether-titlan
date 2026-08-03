@@ -7,7 +7,7 @@ use wasm_bindgen::prelude::*;
 
 // The QR payload must remain readable after the camera downsizes the screen.
 // 1,500 characters worked as a transport limit but was too dense in practice.
-const DATA_CHUNK_CHARS: usize = 900;
+const DATA_CHUNK_CHARS: usize = 600;
 const MAX_FILENAME_BYTES: usize = 255;
 const MAX_FILE_BYTES: usize = 1_500 * 1024;
 

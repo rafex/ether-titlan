@@ -11,7 +11,7 @@ const QR_SIZE = 640;
 const PACKET_HOLD_FRAMES = 3;
 const MAX_SCAN_WIDTH = 1280;
 const QR_OPTIONS = {
-  errorCorrectionLevel: "M",
+  errorCorrectionLevel: "L",
   margin: 4,
   width: QR_SIZE,
   color: { dark: "#000000", light: "#ffffff" },
