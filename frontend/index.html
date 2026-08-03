@@ -23,6 +23,9 @@
       .drop-zone { border: 2px dashed #50678f; border-radius: 14px; padding: 34px 18px; text-align: center; transition: border-color .2s, background .2s; }
       .drop-zone.dragover { border-color: #36b37e; background: #172b38; }
       .actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0; }
+      .qr-settings { display: grid; gap: 8px; margin: 16px 0; padding: 12px; border: 1px solid #26344e; border-radius: 10px; }
+      .qr-settings label { display: flex; justify-content: space-between; gap: 12px; color: #c9d5e8; }
+      .qr-settings input[type="range"] { width: 100%; accent-color: #36b37e; }
       .status { min-height: 1.5em; color: #b8c5d9; }
       .error { color: #ff9b9b; }
       .progress-wrap { margin: 16px 0; }
@@ -58,6 +61,17 @@
         <div class="actions">
           <button id="start-sender" disabled>Iniciar emisión</button>
           <button id="stop-sender" class="secondary" disabled>Detener</button>
+        </div>
+        <div class="qr-settings">
+          <label for="qr-chunk-size"><span>Densidad del QR</span><output id="qr-settings-label">600 caracteres por paquete</output></label>
+          <input id="qr-chunk-size" type="range" min="300" max="1500" step="100" value="600" />
+          <label for="qr-error-correction"><span>Corrección de errores</span>
+            <select id="qr-error-correction">
+              <option value="L" selected>L — más capacidad</option>
+              <option value="M">M — más tolerancia</option>
+            </select>
+          </label>
+          <p class="hint small">Valores bajos generan QR más legibles; cambiar el control reprocesa el archivo sin recompilar WASM.</p>
         </div>
         <p id="sender-file" class="status">Ningún archivo seleccionado.</p>
         <div class="progress-wrap">

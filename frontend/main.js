@@ -1,5 +1,5 @@
 import init, {
-  compress_and_split,
+  compress_and_split_with_chunk_size,
   process_packet,
   receiver_filename,
   receiver_progress,
@@ -10,12 +10,6 @@ const MAX_FILE_BYTES = 1.5 * 1024 * 1024;
 const QR_SIZE = 640;
 const PACKET_HOLD_FRAMES = 3;
 const MAX_SCAN_WIDTH = 1280;
-const QR_OPTIONS = {
-  errorCorrectionLevel: "L",
-  margin: 4,
-  width: QR_SIZE,
-  color: { dark: "#000000", light: "#ffffff" },
-};
 
 const $ = (id) => document.getElementById(id);
 const sender = {
@@ -55,6 +49,28 @@ function receiverLog(message, details = undefined) {
   if (debug) debug.textContent = receiver.logLines.join("\n");
   if (details) console.info(`[Tōna receiver] ${message}`, details);
   else console.info(`[Tōna receiver] ${message}`);
+}
+
+function qrSettings() {
+  return {
+    chunkChars: Number($("qr-chunk-size").value),
+    errorCorrectionLevel: $("qr-error-correction").value,
+  };
+}
+
+function qrOptions() {
+  return {
+    errorCorrectionLevel: qrSettings().errorCorrectionLevel,
+    margin: 4,
+    width: QR_SIZE,
+    color: { dark: "#000000", light: "#ffffff" },
+  };
+}
+
+function updateQrSettingsLabel() {
+  const settings = qrSettings();
+  const readability = settings.chunkChars <= 600 ? "alta" : settings.chunkChars <= 900 ? "media" : "baja";
+  $("qr-settings-label").textContent = `${settings.chunkChars} caracteres por paquete · legibilidad ${readability} · corrección ${settings.errorCorrectionLevel}`;
 }
 
 async function checkBackend() {
@@ -110,7 +126,7 @@ function renderSenderFrame() {
 
   const payload = sender.packets[sender.index];
   sender.rendering = true;
-  window.QRCode.toCanvas(senderCanvas, payload, QR_OPTIONS, (error) => {
+  window.QRCode.toCanvas(senderCanvas, payload, qrOptions(), (error) => {
     sender.rendering = false;
     if (error) {
       stopSender();
@@ -149,11 +165,16 @@ async function loadFile(file) {
 
   try {
     const buffer = await file.arrayBuffer();
-    sender.packets = compress_and_split(new Uint8Array(buffer), file.name);
+    const settings = qrSettings();
+    sender.packets = compress_and_split_with_chunk_size(
+      new Uint8Array(buffer),
+      file.name,
+      settings.chunkChars,
+    );
     if (!sender.packets.length) throw new Error("WASM rechazó el archivo o el nombre es demasiado largo.");
     sender.file = file;
     $("start-sender").disabled = false;
-    setStatus($("sender-file"), `${file.name} — ${(file.size / 1024).toFixed(1)} KiB listo.`);
+    setStatus($("sender-file"), `${file.name} — ${(file.size / 1024).toFixed(1)} KiB listo con paquetes de ${settings.chunkChars} caracteres.`);
     updateSenderProgress();
   } catch (error) {
     setStatus($("sender-file"), `No se pudo preparar el archivo: ${error.message}`, true);
@@ -328,6 +349,15 @@ $("stop-sender").addEventListener("click", stopSender);
 $("start-receiver").addEventListener("click", startReceiver);
 $("stop-receiver").addEventListener("click", stopReceiver);
 document.querySelectorAll(".tab").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tab)));
+$("qr-chunk-size").addEventListener("input", updateQrSettingsLabel);
+$("qr-chunk-size").addEventListener("change", () => {
+  if (sender.file) loadFile(sender.file);
+});
+$("qr-error-correction").addEventListener("change", () => {
+  updateQrSettingsLabel();
+  if (sender.file) loadFile(sender.file);
+});
+updateQrSettingsLabel();
 window.addEventListener("beforeunload", () => { stopSender(); stopReceiver(); });
 
 try {

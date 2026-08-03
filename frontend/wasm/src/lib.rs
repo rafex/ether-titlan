@@ -5,9 +5,11 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use wasm_bindgen::prelude::*;
 
-// The QR payload must remain readable after the camera downsizes the screen.
-// 1,500 characters worked as a transport limit but was too dense in practice.
-const DATA_CHUNK_CHARS: usize = 600;
+// The QR payload is selected at runtime by the frontend. These bounds protect
+// the receiver while allowing a device-specific speed/readability trade-off.
+const DEFAULT_DATA_CHUNK_CHARS: usize = 600;
+const MIN_DATA_CHUNK_CHARS: usize = 300;
+const MAX_DATA_CHUNK_CHARS: usize = 1_500;
 const MAX_FILENAME_BYTES: usize = 255;
 const MAX_FILE_BYTES: usize = 1_500 * 1024;
 
@@ -145,6 +147,20 @@ fn install_header(state: &mut ReceiverState, header: HeaderMetadata) -> Option<V
 
 #[wasm_bindgen]
 pub fn compress_and_split(buffer: Vec<u8>, filename: String) -> Vec<String> {
+    compress_and_split_with_chunk_size(buffer, filename, DEFAULT_DATA_CHUNK_CHARS as u32)
+}
+
+#[wasm_bindgen]
+pub fn compress_and_split_with_chunk_size(
+    buffer: Vec<u8>,
+    filename: String,
+    chunk_chars: u32,
+) -> Vec<String> {
+    let chunk_chars = chunk_chars as usize;
+    if !(MIN_DATA_CHUNK_CHARS..=MAX_DATA_CHUNK_CHARS).contains(&chunk_chars) {
+        return Vec::new();
+    }
+
     if buffer.len() > MAX_FILE_BYTES
         || filename.is_empty()
         || filename.as_bytes().len() > MAX_FILENAME_BYTES
@@ -160,7 +176,7 @@ pub fn compress_and_split(buffer: Vec<u8>, filename: String) -> Vec<String> {
         None => return Vec::new(),
     };
     let encoded = STANDARD.encode(compressed);
-    let total_packets = encoded.len().div_ceil(DATA_CHUNK_CHARS);
+    let total_packets = encoded.len().div_ceil(chunk_chars);
     let file_checksum = checksum(&buffer, filename.as_bytes());
 
     let header = format!(
@@ -173,7 +189,7 @@ pub fn compress_and_split(buffer: Vec<u8>, filename: String) -> Vec<String> {
     let mut packets = Vec::with_capacity(total_packets + 1);
     packets.push(header);
 
-    for (index, chunk) in encoded.as_bytes().chunks(DATA_CHUNK_CHARS).enumerate() {
+    for (index, chunk) in encoded.as_bytes().chunks(chunk_chars).enumerate() {
         let chunk = std::str::from_utf8(chunk).expect("Base64 is always valid UTF-8");
         packets.push(format!("DATA|{:016x}|{}|{}", file_checksum, index, chunk));
     }
@@ -209,7 +225,7 @@ pub fn process_packet(packet: String) -> Option<Vec<u8>> {
         let checksum_value = parse_checksum(fields[1])?;
         let index = fields[2].parse::<usize>().ok()?;
         let chunk = fields[3];
-        if chunk.is_empty() || chunk.len() > DATA_CHUNK_CHARS {
+        if chunk.is_empty() || chunk.len() > MAX_DATA_CHUNK_CHARS {
             return None;
         }
 
@@ -255,7 +271,8 @@ mod tests {
     #[test]
     fn compressed_round_trip_allows_out_of_order_packets() {
         let input: Vec<u8> = (0..10_000).map(|value| (value % 251) as u8).collect();
-        let packets = compress_and_split(input.clone(), "foto.bin".to_string());
+        let packets =
+            compress_and_split_with_chunk_size(input.clone(), "foto.bin".to_string(), 600);
 
         reset_receiver();
         for packet in packets.iter().skip(1).rev() {
@@ -279,7 +296,8 @@ mod tests {
                 (seed >> 24) as u8
             })
             .collect();
-        let packets = compress_and_split(input.clone(), "repetido.dat".to_string());
+        let packets =
+            compress_and_split_with_chunk_size(input.clone(), "repetido.dat".to_string(), 600);
         reset_receiver();
         assert!(process_packet(packets[0].clone()).is_none());
         assert!(process_packet(packets[1].clone()).is_none());
@@ -295,7 +313,8 @@ mod tests {
     #[test]
     fn data_packets_can_arrive_before_metadata() {
         let input = vec![7u8; 2_000];
-        let packets = compress_and_split(input.clone(), "antes.bin".to_string());
+        let packets =
+            compress_and_split_with_chunk_size(input.clone(), "antes.bin".to_string(), 600);
         reset_receiver();
         for packet in packets.iter().skip(1) {
             assert!(process_packet(packet.clone()).is_none());
