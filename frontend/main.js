@@ -1,23 +1,24 @@
 import init, {
-  compress_and_split_with_chunk_size,
-  process_packet,
-  receiver_control_packet,
-  receiver_filename,
-  receiver_info,
-  receiver_missing_ranges,
-  receiver_packet_map,
-  receiver_progress,
-  reset_receiver,
+  binary_receiver_control_packet,
+  binary_receiver_filename,
+  binary_receiver_info,
+  binary_receiver_missing_ranges,
+  binary_receiver_packet_map,
+  binary_receiver_progress,
+  prepare_binary_packets,
+  process_binary_packet,
+  reset_binary_receiver,
 } from "./pkg/qr_file_transfer.js";
 
 const MAX_FILE_BYTES = 1.5 * 1024 * 1024;
 const QR_SIZE = 640;
-const PACKET_HOLD_FRAMES = 3;
+const DEFAULT_CHUNK_BYTES = 800;
 const MAX_SCAN_WIDTH = 1280;
 
 const $ = (id) => document.getElementById(id);
 const sender = {
   packets: [],
+  metadata: null,
   queue: [],
   selectedDataIndexes: null,
   file: null,
@@ -27,6 +28,8 @@ const sender = {
   running: false,
   packetRendered: false,
   packetFrames: 0,
+  repeatMode: "auto",
+  recoveryMode: false,
   clock: { startedAt: null, elapsedMs: 0, timer: null },
 };
 const receiver = {
@@ -38,6 +41,9 @@ const receiver = {
   stats: { frames: 0, qrDetections: 0, duplicates: 0, packets: 0 },
   controlRendering: false,
   controlPayload: "",
+  roi: null,
+  roiMisses: 0,
+  scanWithVideoFrameCallback: false,
   clock: { startedAt: null, elapsedMs: 0, timer: null },
 };
 const senderControl = {
@@ -117,7 +123,9 @@ function receiverLog(message, details = undefined) {
 
 function qrSettings() {
   return {
-    chunkChars: Number($("qr-chunk-size").value),
+    chunkBytes: Number($("qr-chunk-size").value),
+    fecGroupSize: Number($("qr-fec-group").value),
+    repeatMode: $("qr-repeat-mode").value,
     errorCorrectionLevel: $("qr-error-correction").value,
   };
 }
@@ -133,8 +141,39 @@ function qrOptions() {
 
 function updateQrSettingsLabel() {
   const settings = qrSettings();
-  const readability = settings.chunkChars <= 600 ? "alta" : settings.chunkChars <= 900 ? "media" : "baja";
-  $("qr-settings-label").textContent = `${settings.chunkChars} caracteres por paquete · legibilidad ${readability} · corrección ${settings.errorCorrectionLevel}`;
+  const readability = settings.chunkBytes <= 800 ? "alta" : settings.chunkBytes <= 1200 ? "media" : "baja";
+  const fec = settings.fecGroupSize ? `FEC 1/${settings.fecGroupSize}` : "sin FEC";
+  $("qr-settings-label").textContent = `${settings.chunkBytes} bytes por paquete · legibilidad ${readability} · ${fec} · corrección ${settings.errorCorrectionLevel}`;
+}
+
+function qrBinaryPayload(packet) {
+  return [{ data: packet, mode: "byte" }];
+}
+
+function packetChecksum(packet) {
+  if (!packet || packet.length < 15) return "";
+  return Array.from(packet.slice(7, 15), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function packetType(packet) {
+  return packet?.[3];
+}
+
+function senderDataPacketCount() {
+  return sender.metadata?.dataPackets || 0;
+}
+
+function senderParityPacketCount() {
+  return sender.metadata?.parityPackets || 0;
+}
+
+function holdFramesFor(entry) {
+  const mode = sender.repeatMode;
+  if (mode === "fast") return 1;
+  if (mode === "reliable") return 4;
+  if (sender.recoveryMode) return 4;
+  if (entry?.kind === "header" || entry?.kind === "parity") return 2;
+  return entry?.payload?.length > 1050 ? 3 : 2;
 }
 
 async function checkBackend() {
@@ -150,7 +189,7 @@ async function checkBackend() {
 }
 
 function updateSenderProgress() {
-  const totalData = Math.max(sender.packets.length - 1, 0);
+  const totalData = senderDataPacketCount();
   const queueTotal = sender.queue.length;
   const current = queueTotal ? sender.index + 1 : 0;
   const entry = sender.queue[sender.index];
@@ -158,13 +197,16 @@ function updateSenderProgress() {
   $("sender-progress").value = current;
   $("sender-progress-label").textContent = entry?.kind === "header"
     ? `Cabecera · envío ${current} de ${queueTotal}`
+    : entry?.kind === "parity"
+      ? `FEC reparación · envío ${current} de ${queueTotal}`
     : `Paquete ${entry ? entry.dataIndex + 1 : 0} de ${totalData} · envío ${current} de ${queueTotal}`;
   const selected = sender.selectedDataIndexes ? sender.selectedDataIndexes.length : totalData;
-  $("sender-packet-meta").innerHTML = `Paquetes: ${selected} de ${totalData} seleccionados · tiempo: <time id="sender-elapsed">${formatElapsed(clockValue(sender.clock))}</time>`;
+  const parity = sender.selectedDataIndexes ? 0 : senderParityPacketCount();
+  $("sender-packet-meta").innerHTML = `Datos: ${selected} de ${totalData} · reparación FEC: ${parity} · tiempo: <time id="sender-elapsed">${formatElapsed(clockValue(sender.clock))}</time>`;
 }
 
 function allSenderDataIndexes() {
-  return Array.from({ length: Math.max(sender.packets.length - 1, 0) }, (_, index) => index);
+  return Array.from({ length: senderDataPacketCount() }, (_, index) => index);
 }
 
 function buildSenderQueue() {
@@ -175,10 +217,17 @@ function buildSenderQueue() {
     return;
   }
 
+  const body = indexes.map((dataIndex) => ({ kind: "data", payload: sender.packets[dataIndex + 1], dataIndex }));
+  if (!sender.selectedDataIndexes && senderParityPacketCount()) {
+    const parityStart = senderDataPacketCount() + 1;
+    for (let index = 0; index < senderParityPacketCount(); index += 1) {
+      body.push({ kind: "parity", payload: sender.packets[parityStart + index], dataIndex: -1 });
+    }
+  }
   sender.queue = [header];
-  indexes.forEach((dataIndex, position) => {
-    if (indexes.length > 1 && position === Math.ceil(indexes.length / 2)) sender.queue.push(header);
-    sender.queue.push({ kind: "data", payload: sender.packets[dataIndex + 1], dataIndex });
+  body.forEach((entry, position) => {
+    if (body.length > 1 && position === Math.ceil(body.length / 2)) sender.queue.push(header);
+    sender.queue.push(entry);
   });
   sender.queue.push(header);
   sender.index = 0;
@@ -203,11 +252,12 @@ function parseMissingRanges(value, total) {
 }
 
 function applyMissingSelection(value, source = "manual") {
-  const total = Math.max(sender.packets.length - 1, 0);
+  const total = senderDataPacketCount();
   if (!sender.packets.length) throw new Error("Selecciona un archivo antes de aplicar faltantes.");
   const indexes = parseMissingRanges(value, total);
   if (!indexes.length) {
     sender.selectedDataIndexes = null;
+    sender.recoveryMode = false;
     $("sender-missing-ranges").value = "";
     setStatus($("sender-file"), `${sender.file.name} — emisión configurada para todos los paquetes.`);
   } else {
@@ -220,21 +270,23 @@ function applyMissingSelection(value, source = "manual") {
 }
 
 function updateReceiverProgress() {
-  const [received, total] = receiver_progress();
+  const [received, total] = binary_receiver_progress();
   $("receiver-progress").max = Math.max(total, 1);
   $("receiver-progress").value = received;
   $("receiver-progress-label").textContent = `Paquetes recibidos: ${received} de ${total}`;
-  const info = JSON.parse(receiver_info() || "{}");
+  const info = JSON.parse(binary_receiver_info() || "{}");
   if (info.filename) {
     const size = info.file_size ? `${(info.file_size / 1024).toFixed(1)} KiB` : "tamaño desconocido";
-    $("receiver-file-meta").textContent = `Archivo: ${info.filename} · ${size} · checksum ${info.checksum || "—"}`;
+    const compressed = info.compressed_size ? ` · comprimido ${(info.compressed_size / 1024).toFixed(1)} KiB` : "";
+    const fec = info.fec_group_size ? ` · FEC recuperados ${info.recovered_packets || 0}` : "";
+    $("receiver-file-meta").textContent = `Archivo: ${info.filename} · ${size}${compressed} · ${info.codec || "—"}${fec} · checksum ${info.checksum || "—"}`;
   } else {
     $("receiver-file-meta").textContent = "Archivo: pendiente de cabecera.";
   }
-  const missing = receiver_missing_ranges();
+  const missing = binary_receiver_missing_ranges();
   const visibleMissing = missing.length > 600 ? `${missing.slice(0, 600)}…` : missing;
   $("receiver-missing-label").textContent = visibleMissing ? `Faltantes: ${visibleMissing}` : (total ? "Faltantes: ninguno" : "Faltantes: —");
-  drawReceiverPacketMap(receiver_packet_map());
+  drawReceiverPacketMap(binary_receiver_packet_map());
   updateReceiverControlQr();
 }
 
@@ -262,7 +314,7 @@ function drawReceiverPacketMap(packetMap) {
 
 function updateReceiverControlQr() {
   if (!window.QRCode || receiver.controlRendering) return;
-  const payload = receiver_control_packet();
+  const payload = binary_receiver_control_packet();
   receiver.controlPayload = payload;
   if (!payload) {
     receiverControlCanvas.getContext("2d").clearRect(0, 0, receiverControlCanvas.width, receiverControlCanvas.height);
@@ -282,7 +334,7 @@ function updateReceiverControlQr() {
         $("receiver-control-status").textContent = `La solicitud es demasiado grande para un QR: ${error.message}`;
         return;
       }
-      const missing = receiver_missing_ranges();
+      const missing = binary_receiver_missing_ranges();
       const visible = missing.length > 600 ? `${missing.slice(0, 600)}…` : missing;
       $("receiver-control-status").textContent = visible
         ? `Solicitud lista: ${visible}`
@@ -312,7 +364,7 @@ function renderSenderFrame() {
 
   if (sender.packetRendered) {
     sender.packetFrames += 1;
-    if (sender.packetFrames < PACKET_HOLD_FRAMES) return;
+    if (sender.packetFrames < holdFramesFor(sender.queue[sender.index])) return;
     sender.packetRendered = false;
     sender.packetFrames = 0;
     sender.index = (sender.index + 1) % sender.queue.length;
@@ -321,7 +373,7 @@ function renderSenderFrame() {
 
   const payload = sender.queue[sender.index].payload;
   sender.rendering = true;
-  window.QRCode.toCanvas(senderCanvas, payload, qrOptions(), (error) => {
+  window.QRCode.toCanvas(senderCanvas, qrBinaryPayload(payload), qrOptions(), (error) => {
     sender.rendering = false;
     if (error) {
       stopSender();
@@ -351,8 +403,10 @@ function startSender() {
 async function loadFile(file) {
   stopSender();
   sender.packets = [];
+  sender.metadata = null;
   sender.queue = [];
   sender.selectedDataIndexes = null;
+  sender.recoveryMode = false;
   sender.file = null;
   resetClock(sender.clock, "sender-elapsed");
   $("sender-missing-ranges").value = "";
@@ -367,16 +421,26 @@ async function loadFile(file) {
   try {
     const buffer = await file.arrayBuffer();
     const settings = qrSettings();
-    sender.packets = compress_and_split_with_chunk_size(
+    sender.packets = Array.from(prepare_binary_packets(
       new Uint8Array(buffer),
       file.name,
-      settings.chunkChars,
-    );
+      settings.chunkBytes,
+      settings.fecGroupSize,
+    ), (packet) => new Uint8Array(packet));
     if (!sender.packets.length) throw new Error("WASM rechazó el archivo o el nombre es demasiado largo.");
     sender.file = file;
+    const header = sender.packets[0];
+    sender.metadata = {
+      checksum: packetChecksum(header),
+      dataPackets: new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(25),
+      chunkBytes: new DataView(header.buffer, header.byteOffset, header.byteLength).getUint16(23),
+      fecGroupSize: header[5],
+      parityPackets: sender.packets.filter((packet) => packetType(packet) === 2).length,
+      codec: header[4] === 1 ? "deflate" : "raw",
+    };
     buildSenderQueue();
     $("start-sender").disabled = false;
-    setStatus($("sender-file"), `${file.name} — ${(file.size / 1024).toFixed(1)} KiB listo con ${sender.packets.length - 1} paquetes de ${settings.chunkChars} caracteres.`);
+    setStatus($("sender-file"), `${file.name} — ${(file.size / 1024).toFixed(1)} KiB listo con ${sender.metadata.dataPackets} paquetes binarios de ${settings.chunkBytes} bytes (${sender.metadata.codec}).`);
     updateSenderProgress();
   } catch (error) {
     setStatus($("sender-file"), `No se pudo preparar el archivo: ${error.message}`, true);
@@ -390,12 +454,12 @@ function handleReceiverRequest(payload) {
     setStatus($("sender-file"), "Solicitud recibida; selecciona primero el archivo original.", true);
     return true;
   }
-  const headerFields = sender.packets[0].split("|");
-  if (fields[1] !== headerFields[3]) {
+  if (fields[1] !== sender.metadata?.checksum) {
     setStatus($("sender-file"), "La solicitud pertenece a otro archivo.", true);
     return true;
   }
   try {
+    sender.recoveryMode = Boolean(fields[2]);
     applyMissingSelection(fields[2], "QR del receptor");
     setStatus($("sender-file"), `${sender.file.name} — solicitud de faltantes aplicada; inicia o continúa la emisión.`);
     return true;
@@ -474,8 +538,14 @@ async function startSenderControl() {
 
 function stopReceiver() {
   receiver.running = false;
-  if (receiver.frame) cancelAnimationFrame(receiver.frame);
+  const video = $("receiver-video");
+  if (receiver.frame && receiver.frameKind === "video" && video.cancelVideoFrameCallback) {
+    video.cancelVideoFrameCallback(receiver.frame);
+  } else if (receiver.frame) {
+    cancelAnimationFrame(receiver.frame);
+  }
   receiver.frame = null;
+  receiver.frameKind = null;
   if (receiver.stream) receiver.stream.getTracks().forEach((track) => track.stop());
   receiver.stream = null;
   $("receiver-video").srcObject = null;
@@ -486,7 +556,7 @@ function stopReceiver() {
 }
 
 function finishDownload(bytes) {
-  const filename = receiver_filename() || "archivo-recibido.bin";
+  const filename = binary_receiver_filename() || "archivo-recibido.bin";
   pauseClock(receiver.clock, "receiver-elapsed");
   const blob = new Blob([bytes], { type: "application/octet-stream" });
   const url = URL.createObjectURL(blob);
@@ -501,9 +571,54 @@ function finishDownload(bytes) {
   updateReceiverProgress();
 }
 
+function scheduleReceiverFrame() {
+  if (!receiver.running) return;
+  const video = $("receiver-video");
+  if (video.requestVideoFrameCallback) {
+    receiver.frameKind = "video";
+    receiver.frame = video.requestVideoFrameCallback(() => scanReceiverFrame());
+  } else {
+    receiver.frameKind = "raf";
+    receiver.frame = requestAnimationFrame(scanReceiverFrame);
+  }
+}
+
+function updateReceiverRoi(code, crop) {
+  const points = [
+    code.location?.topLeftCorner,
+    code.location?.topRightCorner,
+    code.location?.bottomRightCorner,
+    code.location?.bottomLeftCorner,
+  ].filter(Boolean);
+  if (points.length !== 4) return;
+  const minX = Math.min(...points.map((point) => point.x));
+  const maxX = Math.max(...points.map((point) => point.x));
+  const minY = Math.min(...points.map((point) => point.y));
+  const maxY = Math.max(...points.map((point) => point.y));
+  const marginX = Math.max(18, (maxX - minX) * 0.12);
+  const marginY = Math.max(18, (maxY - minY) * 0.12);
+  const x = Math.max(0, minX - marginX);
+  const y = Math.max(0, minY - marginY);
+  const right = Math.min(crop.scanWidth, maxX + marginX);
+  const bottom = Math.min(crop.scanHeight, maxY + marginY);
+  receiver.roi = {
+    x: crop.x + x / crop.scanWidth * crop.width,
+    y: crop.y + y / crop.scanHeight * crop.height,
+    width: (right - x) / crop.scanWidth * crop.width,
+    height: (bottom - y) / crop.scanHeight * crop.height,
+  };
+  receiver.roiMisses = 0;
+}
+
+function qrFingerprint(code) {
+  if (code.data?.startsWith("REQUEST|")) return code.data;
+  const bytes = code.binaryData || [];
+  return `binary:${bytes.length}:${Array.from(bytes.slice(0, 18)).join(",")}`;
+}
+
 function scanReceiverFrame() {
   if (!receiver.running) return;
-  receiver.frame = requestAnimationFrame(scanReceiverFrame);
+  scheduleReceiverFrame();
   receiver.stats.frames += 1;
   const video = $("receiver-video");
   if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth) {
@@ -515,15 +630,34 @@ function scanReceiverFrame() {
     return;
   }
 
-  const scale = Math.min(1, MAX_SCAN_WIDTH / video.videoWidth);
-  const width = Math.max(640, Math.round(video.videoWidth * scale));
-  const height = Math.round(video.videoHeight * (width / video.videoWidth));
+  const activeRoi = receiver.roi || { x: 0, y: 0, width: 1, height: 1 };
+  const crop = {
+    x: Math.max(0, Math.min(1, activeRoi.x)),
+    y: Math.max(0, Math.min(1, activeRoi.y)),
+    width: Math.max(0.1, Math.min(1, activeRoi.width)),
+    height: Math.max(0.1, Math.min(1, activeRoi.height)),
+  };
+  const cropWidth = Math.round(video.videoWidth * crop.width);
+  const cropHeight = Math.round(video.videoHeight * crop.height);
+  const scale = Math.min(1, MAX_SCAN_WIDTH / cropWidth);
+  const width = Math.max(640, Math.round(cropWidth * scale));
+  const height = Math.max(480, Math.round(cropHeight * (width / cropWidth)));
   if (scanCanvas.width !== width || scanCanvas.height !== height) {
     scanCanvas.width = width;
     scanCanvas.height = height;
   }
   scanContext.imageSmoothingEnabled = false;
-  scanContext.drawImage(video, 0, 0, width, height);
+  scanContext.drawImage(
+    video,
+    Math.round(video.videoWidth * crop.x),
+    Math.round(video.videoHeight * crop.y),
+    cropWidth,
+    cropHeight,
+    0,
+    0,
+    width,
+    height,
+  );
   const image = scanContext.getImageData(0, 0, width, height);
   let code;
   try {
@@ -532,29 +666,38 @@ function scanReceiverFrame() {
     receiverLog("jsQR lanzó una excepción", { message: error.message });
     return;
   }
-  if (!code?.data) {
+  if (!code?.binaryData?.length) {
+    receiver.roiMisses += 1;
+    if (receiver.roiMisses >= 10) receiver.roi = null;
     if (receiver.stats.frames % 60 === 0) receiverLog("Sin QR detectado", {
       frames: receiver.stats.frames,
       video: `${video.videoWidth}x${video.videoHeight}`,
       scan: `${width}x${height}`,
+      roi: receiver.roi ? "activa" : "completa",
     });
     return;
   }
 
   receiver.stats.qrDetections += 1;
-  if (code.data === receiver.lastPacket) {
+  updateReceiverRoi(code, {
+    ...crop,
+    scanWidth: width,
+    scanHeight: height,
+  });
+  const fingerprint = qrFingerprint(code);
+  if (fingerprint === receiver.lastPacket) {
     receiver.stats.duplicates += 1;
     return;
   }
 
-  receiver.lastPacket = code.data;
+  receiver.lastPacket = fingerprint;
   receiverLog("QR detectado", {
-    length: code.data.length,
-    prefix: code.data.slice(0, 20),
+    length: code.binaryData.length,
+    type: code.data?.startsWith("REQUEST|") ? "control" : "binario",
     detections: receiver.stats.qrDetections,
   });
   try {
-    const assembled = process_packet(code.data);
+    const assembled = process_binary_packet(new Uint8Array(code.binaryData));
     receiver.stats.packets += 1;
     updateReceiverProgress();
     receiverLog("Paquete enviado a WASM", {
@@ -580,9 +723,12 @@ async function startReceiver() {
   try {
     receiver.logLines = [];
     receiver.stats = { frames: 0, qrDetections: 0, duplicates: 0, packets: 0 };
+    receiver.roi = null;
+    receiver.roiMisses = 0;
+    receiver.frameKind = null;
     resetClock(receiver.clock, "receiver-elapsed");
     receiverLog("Solicitando cámara");
-    reset_receiver();
+    reset_binary_receiver();
     receiver.lastPacket = "";
     updateReceiverProgress();
     receiver.stream = await navigator.mediaDevices.getUserMedia({
@@ -618,7 +764,9 @@ async function startReceiver() {
     $("start-receiver").disabled = true;
     $("stop-receiver").disabled = false;
     setStatus($("receiver-status"), "Cámara activa. Buscando paquetes…");
-    scanReceiverFrame();
+    receiver.scanWithVideoFrameCallback = Boolean(video.requestVideoFrameCallback);
+    receiverLog("Escaneo sincronizado con frames de vídeo", { requestVideoFrameCallback: receiver.scanWithVideoFrameCallback });
+    scheduleReceiverFrame();
   } catch (error) {
     stopReceiver();
     setStatus($("receiver-status"), `No se pudo activar la cámara: ${error.message}`, true);
@@ -668,6 +816,14 @@ $("qr-chunk-size").addEventListener("change", () => {
 $("qr-error-correction").addEventListener("change", () => {
   updateQrSettingsLabel();
   if (sender.file) loadFile(sender.file);
+});
+$("qr-fec-group").addEventListener("change", () => {
+  updateQrSettingsLabel();
+  if (sender.file) loadFile(sender.file);
+});
+$("qr-repeat-mode").addEventListener("change", () => {
+  sender.repeatMode = $("qr-repeat-mode").value;
+  updateQrSettingsLabel();
 });
 updateQrSettingsLabel();
 window.addEventListener("beforeunload", () => { stopSender(); stopSenderControl(); stopReceiver(); });

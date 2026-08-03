@@ -88,15 +88,28 @@
           <canvas id="sender-control-scan-canvas" hidden></canvas>
         </div>
         <div class="qr-settings">
-          <label for="qr-chunk-size"><span>Densidad del QR</span><output id="qr-settings-label">600 caracteres por paquete</output></label>
-          <input id="qr-chunk-size" type="range" min="300" max="1500" step="100" value="600" />
+          <label for="qr-chunk-size"><span>Densidad del QR</span><output id="qr-settings-label">600 bytes por paquete</output></label>
+          <input id="qr-chunk-size" type="range" min="400" max="1800" step="100" value="600" />
           <label for="qr-error-correction"><span>Corrección de errores</span>
             <select id="qr-error-correction">
               <option value="L" selected>L — más capacidad</option>
               <option value="M">M — más tolerancia</option>
             </select>
           </label>
-          <p class="hint small">Valores bajos generan QR más legibles; cambiar el control reprocesa el archivo sin recompilar WASM.</p>
+          <label for="qr-fec-group"><span>Recuperación FEC</span>
+            <select id="qr-fec-group">
+              <option value="8" selected>1 reparación cada 8 paquetes</option>
+              <option value="0">Desactivada — menor tráfico</option>
+            </select>
+          </label>
+          <label for="qr-repeat-mode"><span>Repetición</span>
+            <select id="qr-repeat-mode">
+              <option value="auto" selected>Automática</option>
+              <option value="fast">Rápida</option>
+              <option value="reliable">Confiable</option>
+            </select>
+          </label>
+          <p class="hint small">El transporte usa bytes binarios directamente. Valores bajos generan QR más legibles; cambiar el control reprocesa el archivo sin recompilar WASM.</p>
         </div>
         <p id="sender-file" class="status">Ningún archivo seleccionado.</p>
         <p id="sender-packet-meta" class="meta small">Paquetes: 0 · tiempo: <time id="sender-elapsed">00:00</time></p>

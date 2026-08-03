@@ -346,6 +346,540 @@ pub fn receiver_control_packet() -> String {
     })
 }
 
+// Binary QR protocol. Unlike the legacy text protocol above, this format
+// sends compressed bytes directly in QR byte mode, avoiding Base64 overhead.
+const BINARY_MAGIC: [u8; 3] = *b"TN2";
+const BINARY_HEADER_TYPE: u8 = 0;
+const BINARY_DATA_TYPE: u8 = 1;
+const BINARY_PARITY_TYPE: u8 = 2;
+const BINARY_HEADER_FIXED_BYTES: usize = 31;
+const BINARY_DATA_FIXED_BYTES: usize = 16;
+const BINARY_MAX_CHUNK_BYTES: usize = 1_800;
+const BINARY_MIN_CHUNK_BYTES: usize = 400;
+const BINARY_MAX_PENDING_PACKETS: usize = 10_000;
+
+#[derive(Clone, Debug)]
+struct BinaryHeader {
+    codec: u8,
+    checksum: u64,
+    file_size: usize,
+    compressed_size: usize,
+    chunk_size: usize,
+    data_packets: usize,
+    fec_group_size: usize,
+    filename: String,
+}
+
+#[derive(Default)]
+struct BinaryReceiverState {
+    header: Option<BinaryHeader>,
+    chunks: HashMap<usize, Vec<u8>>,
+    parity: HashMap<usize, Vec<u8>>,
+    pending: Vec<Vec<u8>>,
+    received_packets: usize,
+    recovered_packets: usize,
+    complete: bool,
+}
+
+#[derive(Serialize)]
+struct BinaryReceiverInfo {
+    filename: String,
+    total_packets: usize,
+    received_packets: usize,
+    missing_packets: usize,
+    file_size: usize,
+    compressed_size: usize,
+    checksum: Option<String>,
+    codec: String,
+    fec_group_size: usize,
+    recovered_packets: usize,
+    complete: bool,
+}
+
+thread_local! {
+    static BINARY_RECEIVER: RefCell<BinaryReceiverState> = RefCell::new(BinaryReceiverState::default());
+}
+
+fn push_u16(target: &mut Vec<u8>, value: usize) {
+    target.extend_from_slice(&(value as u16).to_be_bytes());
+}
+
+fn push_u32(target: &mut Vec<u8>, value: usize) {
+    target.extend_from_slice(&(value as u32).to_be_bytes());
+}
+
+fn read_u16(source: &[u8], offset: usize) -> Option<usize> {
+    Some(u16::from_be_bytes(source.get(offset..offset + 2)?.try_into().ok()?) as usize)
+}
+
+fn read_u32(source: &[u8], offset: usize) -> Option<usize> {
+    Some(u32::from_be_bytes(source.get(offset..offset + 4)?.try_into().ok()?) as usize)
+}
+
+fn read_u64(source: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_be_bytes(
+        source.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
+fn binary_compress(buffer: &[u8]) -> Option<(u8, Vec<u8>)> {
+    let compressed = compress_file(buffer)?;
+    if compressed.len() < buffer.len() {
+        Some((1, compressed))
+    } else {
+        Some((0, buffer.to_vec()))
+    }
+}
+
+fn binary_header_packet(header: &BinaryHeader) -> Vec<u8> {
+    let filename = header.filename.as_bytes();
+    let mut packet = Vec::with_capacity(BINARY_HEADER_FIXED_BYTES + filename.len());
+    packet.extend_from_slice(&BINARY_MAGIC);
+    packet.push(BINARY_HEADER_TYPE);
+    packet.push(header.codec);
+    packet.push(header.fec_group_size as u8);
+    packet.push(0); // reserved flags
+    packet.extend_from_slice(&header.checksum.to_be_bytes());
+    push_u32(&mut packet, header.file_size);
+    push_u32(&mut packet, header.compressed_size);
+    push_u16(&mut packet, header.chunk_size);
+    push_u32(&mut packet, header.data_packets);
+    push_u16(&mut packet, filename.len());
+    packet.extend_from_slice(filename);
+    packet
+}
+
+fn build_binary_packets(
+    buffer: &[u8],
+    filename: &str,
+    chunk_size: usize,
+    fec_group_size: usize,
+) -> Option<Vec<Vec<u8>>> {
+    if !(BINARY_MIN_CHUNK_BYTES..=BINARY_MAX_CHUNK_BYTES).contains(&chunk_size)
+        || !matches!(fec_group_size, 0 | 8)
+        || buffer.len() > MAX_FILE_BYTES
+        || filename.is_empty()
+        || filename.as_bytes().len() > MAX_FILENAME_BYTES
+        || filename.chars().any(|character| character.is_control())
+    {
+        return None;
+    }
+
+    let (codec, encoded) = binary_compress(buffer)?;
+    let data_packets = encoded.len().max(1).div_ceil(chunk_size);
+    let checksum = checksum(buffer, filename.as_bytes());
+    let header = BinaryHeader {
+        codec,
+        checksum,
+        file_size: buffer.len(),
+        compressed_size: encoded.len(),
+        chunk_size,
+        data_packets,
+        fec_group_size,
+        filename: filename.to_string(),
+    };
+
+    let mut padded_chunks = Vec::with_capacity(data_packets);
+    for index in 0..data_packets {
+        let start = index * chunk_size;
+        let end = (start + chunk_size).min(encoded.len());
+        let mut chunk = vec![0u8; chunk_size];
+        if start < end {
+            chunk[..end - start].copy_from_slice(&encoded[start..end]);
+        }
+        padded_chunks.push(chunk);
+    }
+
+    let mut packets = vec![binary_header_packet(&header)];
+    for (index, chunk) in padded_chunks.iter().enumerate() {
+        let start = index * chunk_size;
+        let payload_len = encoded.len().saturating_sub(start).min(chunk_size);
+        let mut packet = Vec::with_capacity(BINARY_DATA_FIXED_BYTES + payload_len);
+        packet.extend_from_slice(&BINARY_MAGIC);
+        packet.push(BINARY_DATA_TYPE);
+        packet.extend_from_slice(&checksum.to_be_bytes());
+        push_u32(&mut packet, index);
+        packet.extend_from_slice(&chunk[..payload_len]);
+        packets.push(packet);
+    }
+
+    if fec_group_size > 0 {
+        for group in 0..data_packets.div_ceil(fec_group_size) {
+            let start = group * fec_group_size;
+            let end = (start + fec_group_size).min(data_packets);
+            let mut parity = vec![0u8; chunk_size];
+            for chunk in &padded_chunks[start..end] {
+                for (position, byte) in chunk.iter().enumerate() {
+                    parity[position] ^= byte;
+                }
+            }
+            let mut packet = Vec::with_capacity(BINARY_DATA_FIXED_BYTES + chunk_size);
+            packet.extend_from_slice(&BINARY_MAGIC);
+            packet.push(BINARY_PARITY_TYPE);
+            packet.extend_from_slice(&checksum.to_be_bytes());
+            push_u32(&mut packet, group);
+            packet.extend_from_slice(&parity);
+            packets.push(packet);
+        }
+    }
+
+    Some(packets)
+}
+
+#[wasm_bindgen]
+pub fn prepare_binary_packets(
+    buffer: Vec<u8>,
+    filename: String,
+    chunk_bytes: u32,
+    fec_group_size: u32,
+) -> JsValue {
+    let Some(packets) = build_binary_packets(
+        &buffer,
+        &filename,
+        chunk_bytes as usize,
+        fec_group_size as usize,
+    ) else {
+        return js_sys::Array::new().into();
+    };
+
+    let output = js_sys::Array::new();
+    for packet in packets {
+        output.push(&js_sys::Uint8Array::from(packet.as_slice()));
+    }
+    output.into()
+}
+
+fn parse_binary_header(packet: &[u8]) -> Option<BinaryHeader> {
+    if packet.len() < BINARY_HEADER_FIXED_BYTES
+        || packet.get(..3)? != BINARY_MAGIC
+        || packet[3] != BINARY_HEADER_TYPE
+    {
+        return None;
+    }
+    let codec = packet[4];
+    let fec_group_size = packet[5] as usize;
+    let checksum = read_u64(packet, 7)?;
+    let file_size = read_u32(packet, 15)?;
+    let compressed_size = read_u32(packet, 19)?;
+    let chunk_size = read_u16(packet, 23)?;
+    let data_packets = read_u32(packet, 25)?;
+    let filename_len = read_u16(packet, 29)?;
+    let filename_start = BINARY_HEADER_FIXED_BYTES;
+    let filename_end = filename_start.checked_add(filename_len)?;
+    let filename = String::from_utf8(packet.get(filename_start..filename_end)?.to_vec()).ok()?;
+
+    if codec > 1
+        || !matches!(fec_group_size, 0 | 8)
+        || !(BINARY_MIN_CHUNK_BYTES..=BINARY_MAX_CHUNK_BYTES).contains(&chunk_size)
+        || data_packets == 0
+        || data_packets > BINARY_MAX_PENDING_PACKETS
+        || file_size > MAX_FILE_BYTES
+        || compressed_size > MAX_FILE_BYTES * 2
+        || filename.is_empty()
+        || filename.as_bytes().len() > MAX_FILENAME_BYTES
+        || filename.chars().any(|character| character.is_control())
+    {
+        return None;
+    }
+
+    let expected_packets = compressed_size.max(1).div_ceil(chunk_size);
+    if data_packets != expected_packets {
+        return None;
+    }
+
+    Some(BinaryHeader {
+        codec,
+        checksum,
+        file_size,
+        compressed_size,
+        chunk_size,
+        data_packets,
+        fec_group_size,
+        filename,
+    })
+}
+
+fn binary_missing_ranges(state: &BinaryReceiverState) -> String {
+    let Some(header) = state.header.as_ref() else {
+        return String::new();
+    };
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < header.data_packets {
+        if state.chunks.contains_key(&index) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < header.data_packets && !state.chunks.contains_key(&index) {
+            index += 1;
+        }
+        let end = index - 1;
+        ranges.push(if start == end {
+            start.to_string()
+        } else {
+            format!("{start}-{end}")
+        });
+    }
+    ranges.join(",")
+}
+
+fn binary_expected_len(header: &BinaryHeader, index: usize) -> usize {
+    header
+        .compressed_size
+        .saturating_sub(index * header.chunk_size)
+        .min(header.chunk_size)
+}
+
+fn try_binary_recover(state: &mut BinaryReceiverState) {
+    let Some(header) = state.header.as_ref() else {
+        return;
+    };
+    if header.fec_group_size == 0 {
+        return;
+    }
+
+    let group_count = header.data_packets.div_ceil(header.fec_group_size);
+    for group in 0..group_count {
+        let Some(parity) = state.parity.get(&group).cloned() else {
+            continue;
+        };
+        let start = group * header.fec_group_size;
+        let end = (start + header.fec_group_size).min(header.data_packets);
+        let missing: Vec<usize> = (start..end)
+            .filter(|index| !state.chunks.contains_key(index))
+            .collect();
+        if missing.len() != 1 {
+            continue;
+        }
+
+        let missing_index = missing[0];
+        let mut recovered = parity;
+        for index in start..end {
+            if index == missing_index {
+                continue;
+            }
+            if let Some(chunk) = state.chunks.get(&index) {
+                for (position, byte) in chunk.iter().enumerate() {
+                    recovered[position] ^= byte;
+                }
+            }
+        }
+        if state.chunks.insert(missing_index, recovered).is_none() {
+            state.received_packets += 1;
+            state.recovered_packets += 1;
+        }
+    }
+}
+
+fn try_binary_assemble(state: &mut BinaryReceiverState) -> Option<Vec<u8>> {
+    let header = state.header.as_ref()?;
+    if state.complete || state.received_packets != header.data_packets {
+        return None;
+    }
+
+    let mut compressed = Vec::with_capacity(header.compressed_size);
+    for index in 0..header.data_packets {
+        compressed.extend_from_slice(state.chunks.get(&index)?);
+    }
+    compressed.truncate(header.compressed_size);
+    let file = if header.codec == 1 {
+        decompress_file(&compressed)?
+    } else {
+        compressed
+    };
+    if file.len() != header.file_size
+        || checksum(&file, header.filename.as_bytes()) != header.checksum
+    {
+        return None;
+    }
+    state.complete = true;
+    Some(file)
+}
+
+fn install_binary_header(state: &mut BinaryReceiverState, header: BinaryHeader) -> Option<Vec<u8>> {
+    let is_new_transfer = state
+        .header
+        .as_ref()
+        .is_none_or(|current| current.checksum != header.checksum);
+    let pending = if is_new_transfer {
+        let pending = std::mem::take(&mut state.pending);
+        *state = BinaryReceiverState {
+            header: Some(header),
+            ..BinaryReceiverState::default()
+        };
+        pending
+    } else {
+        Vec::new()
+    };
+
+    let mut assembled = None;
+    for pending_packet in pending {
+        assembled = process_binary_inner(state, &pending_packet, false).or(assembled);
+    }
+    assembled.or_else(|| try_binary_assemble(state))
+}
+
+fn process_binary_inner(
+    state: &mut BinaryReceiverState,
+    packet: &[u8],
+    allow_pending: bool,
+) -> Option<Vec<u8>> {
+    if packet.len() >= 4 && packet.get(..3) == Some(&BINARY_MAGIC) {
+        match packet[3] {
+            BINARY_HEADER_TYPE => {
+                return install_binary_header(state, parse_binary_header(packet)?);
+            }
+            BINARY_DATA_TYPE => {
+                let checksum_value = read_u64(packet, 4)?;
+                let index = read_u32(packet, 12)?;
+                let Some(header) = state.header.as_ref() else {
+                    if allow_pending && state.pending.len() < BINARY_MAX_PENDING_PACKETS {
+                        state.pending.push(packet.to_vec());
+                    }
+                    return None;
+                };
+                if checksum_value != header.checksum
+                    || index >= header.data_packets
+                    || packet.len() != BINARY_DATA_FIXED_BYTES + binary_expected_len(header, index)
+                {
+                    return None;
+                }
+                let mut chunk = vec![0u8; header.chunk_size];
+                chunk[..packet.len() - BINARY_DATA_FIXED_BYTES]
+                    .copy_from_slice(&packet[BINARY_DATA_FIXED_BYTES..]);
+                if state.chunks.insert(index, chunk).is_none() {
+                    state.received_packets += 1;
+                }
+            }
+            BINARY_PARITY_TYPE => {
+                let checksum_value = read_u64(packet, 4)?;
+                let group = read_u32(packet, 12)?;
+                let Some(header) = state.header.as_ref() else {
+                    if allow_pending && state.pending.len() < BINARY_MAX_PENDING_PACKETS {
+                        state.pending.push(packet.to_vec());
+                    }
+                    return None;
+                };
+                let group_count = header.data_packets.div_ceil(header.fec_group_size.max(1));
+                if checksum_value != header.checksum
+                    || header.fec_group_size == 0
+                    || group >= group_count
+                    || packet.len() != BINARY_DATA_FIXED_BYTES + header.chunk_size
+                {
+                    return None;
+                }
+                state
+                    .parity
+                    .entry(group)
+                    .or_insert_with(|| packet[BINARY_DATA_FIXED_BYTES..].to_vec());
+            }
+            _ => return None,
+        }
+    } else if allow_pending && state.header.is_none() {
+        if state.pending.len() < BINARY_MAX_PENDING_PACKETS {
+            state.pending.push(packet.to_vec());
+        }
+        return None;
+    } else {
+        return None;
+    }
+
+    try_binary_recover(state);
+    try_binary_assemble(state)
+}
+
+#[wasm_bindgen]
+pub fn reset_binary_receiver() {
+    BINARY_RECEIVER.with(|receiver| *receiver.borrow_mut() = BinaryReceiverState::default());
+}
+
+#[wasm_bindgen]
+pub fn process_binary_packet(packet: Vec<u8>) -> Option<Vec<u8>> {
+    BINARY_RECEIVER.with(|receiver| process_binary_inner(&mut receiver.borrow_mut(), &packet, true))
+}
+
+#[wasm_bindgen]
+pub fn binary_receiver_progress() -> Vec<u32> {
+    BINARY_RECEIVER.with(|receiver| {
+        let state = receiver.borrow();
+        let total = state
+            .header
+            .as_ref()
+            .map_or(0, |header| header.data_packets);
+        vec![state.received_packets as u32, total as u32]
+    })
+}
+
+#[wasm_bindgen]
+pub fn binary_receiver_filename() -> String {
+    BINARY_RECEIVER.with(|receiver| {
+        receiver
+            .borrow()
+            .header
+            .as_ref()
+            .map_or_else(String::new, |header| header.filename.clone())
+    })
+}
+
+#[wasm_bindgen]
+pub fn binary_receiver_packet_map() -> Vec<u8> {
+    BINARY_RECEIVER.with(|receiver| {
+        let state = receiver.borrow();
+        let total = state
+            .header
+            .as_ref()
+            .map_or(0, |header| header.data_packets);
+        (0..total)
+            .map(|index| u8::from(state.chunks.contains_key(&index)))
+            .collect()
+    })
+}
+
+#[wasm_bindgen]
+pub fn binary_receiver_missing_ranges() -> String {
+    BINARY_RECEIVER.with(|receiver| binary_missing_ranges(&receiver.borrow()))
+}
+
+#[wasm_bindgen]
+pub fn binary_receiver_control_packet() -> String {
+    BINARY_RECEIVER.with(|receiver| {
+        let state = receiver.borrow();
+        let Some(header) = state.header.as_ref() else {
+            return String::new();
+        };
+        format!(
+            "REQUEST|{:016x}|{}",
+            header.checksum,
+            binary_missing_ranges(&state)
+        )
+    })
+}
+
+#[wasm_bindgen]
+pub fn binary_receiver_info() -> String {
+    BINARY_RECEIVER.with(|receiver| {
+        let state = receiver.borrow();
+        let Some(header) = state.header.as_ref() else {
+            return "{}".to_string();
+        };
+        let info = BinaryReceiverInfo {
+            filename: header.filename.clone(),
+            total_packets: header.data_packets,
+            received_packets: state.received_packets,
+            missing_packets: header.data_packets.saturating_sub(state.received_packets),
+            file_size: header.file_size,
+            compressed_size: header.compressed_size,
+            checksum: Some(format!("{:016x}", header.checksum)),
+            codec: if header.codec == 1 { "deflate" } else { "raw" }.to_string(),
+            fec_group_size: header.fec_group_size,
+            recovered_packets: state.recovered_packets,
+            complete: state.complete,
+        };
+        serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +961,45 @@ mod tests {
         assert!(receiver_missing_ranges().contains('1'));
         assert!(receiver_control_packet().starts_with("REQUEST|"));
         assert!(receiver_info().contains("imagen.tar.gz"));
+    }
+
+    #[test]
+    fn binary_protocol_uses_fec_to_recover_one_missing_packet() {
+        let mut seed = 0x1234_5678u32;
+        let input: Vec<u8> = (0..24_000)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let packets = build_binary_packets(&input, "video.bin", 800, 8).expect("packets");
+        reset_binary_receiver();
+
+        process_binary_packet(packets[0].clone());
+        // Skip data packet 3. All remaining data and parity packets are sent.
+        let mut output = None;
+        for packet in packets.iter().skip(1) {
+            let is_missing_data =
+                packet.get(3) == Some(&BINARY_DATA_TYPE) && read_u32(packet, 12) == Some(3);
+            if !is_missing_data {
+                output = process_binary_packet(packet.clone()).or(output);
+            }
+        }
+
+        let progress = binary_receiver_progress();
+        assert_eq!(progress[0], progress[1]);
+        assert_eq!(output.expect("assembled file"), input);
+        assert!(binary_receiver_info().contains("recovered_packets"));
+    }
+
+    #[test]
+    fn binary_protocol_accepts_data_before_header() {
+        let input = vec![42u8; 5_000];
+        let packets = build_binary_packets(&input, "antes.dat", 800, 0).expect("packets");
+        reset_binary_receiver();
+        process_binary_packet(packets[1].clone());
+        let output = process_binary_packet(packets[0].clone()).expect("pending data");
+        assert_eq!(output, input);
+        assert!(binary_receiver_info().contains("antes.dat"));
     }
 }
