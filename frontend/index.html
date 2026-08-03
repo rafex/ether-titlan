@@ -71,7 +71,8 @@
         </div>
         <div class="actions">
           <button id="start-sender" disabled>Iniciar emisión</button>
-          <button id="stop-sender" class="secondary" disabled>Detener</button>
+          <button id="stop-sender" class="secondary" disabled>Pausar</button>
+          <button id="reset-sender" class="secondary" disabled>Limpiar emisor</button>
         </div>
         <div class="missing-settings">
           <label for="sender-missing-ranges">Retransmitir sólo paquetes faltantes</label>
@@ -114,6 +115,7 @@
         </div>
         <p id="sender-file" class="status">Ningún archivo seleccionado.</p>
         <p id="sender-packet-meta" class="meta small">Paquetes: 0 · tiempo: <time id="sender-elapsed">00:00</time></p>
+        <p id="sender-metrics" class="meta small">Rendimiento: —</p>
         <div class="progress-wrap">
           <progress id="sender-progress" value="0" max="1"></progress>
           <p id="sender-progress-label" class="small">Paquete 0 de 0</p>
@@ -132,6 +134,7 @@
         <div class="actions">
           <button id="start-receiver">Activar cámara</button>
           <button id="stop-receiver" class="secondary" disabled>Detener cámara</button>
+          <button id="reset-receiver" class="secondary">Reiniciar recepción</button>
         </div>
         <video id="receiver-video" autoplay playsinline muted></video>
         <canvas id="scan-canvas" hidden></canvas>
@@ -150,6 +153,7 @@
           <p id="receiver-control-status" class="status small">Aún no hay una cabecera recibida.</p>
         </details>
         <p class="meta small">Tiempo: <time id="receiver-elapsed">00:00</time></p>
+        <p id="receiver-metrics" class="meta small">Rendimiento: —</p>
         <details class="diagnostics">
           <summary>Diagnóstico del receptor</summary>
           <pre id="receiver-debug">Sin iniciar.</pre>

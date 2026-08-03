@@ -22,7 +22,8 @@ El paquete binario contiene:
 
 - versión/magic `TN2`;
 - tipo: cabecera, datos o reparación FEC;
-- checksum FNV-1a de archivo + nombre;
+- identificador FNV-1a de archivo + nombre para control de transferencia;
+- digest SHA-256 de archivo + nombre para validar la reconstrucción;
 - índice de datos o grupo FEC;
 - payload comprimido y nombre original en la cabecera.
 
@@ -107,7 +108,7 @@ Costes:
 - requiere tráfico de reparación adicional;
 - la visualización de “qué paquete falta” deja de ser tan directa.
 
-Para archivos de 1.5 MiB, la alternativa actual es el mejor equilibrio. Fountain Codes tiene sentido si se quiere operación estrictamente unidireccional o cámaras muy inestables.
+Para archivos de 1.5 MiB, la alternativa actual es el mejor equilibrio. Fountain Codes tiene sentido si se quiere operación estrictamente unidireccional o cámaras muy inestables. El MVP todavía no cifra el payload: SHA-256 detecta corrupción, pero no proporciona confidencialidad.
 
 ## Medición recomendada
 
@@ -129,6 +130,8 @@ tiempo total
 
 El contador mostrado en ambos extremos mide tiempo transcurrido, no velocidad de red. El backend Python sólo sirve la aplicación y el endpoint de salud; el archivo se mantiene en WASM y cruza pantalla/cámara.
 
+El emisor prepara los paquetes en un Web Worker. El receptor persiste cada paquete válido en IndexedDB para restaurar una sesión parcial después de una recarga; el control **Reiniciar recepción** limpia esa sesión.
+
 ## Pruebas
 
 El protocolo WASM cubre:
@@ -137,7 +140,8 @@ El protocolo WASM cubre:
 - datos antes de la cabecera;
 - pérdida de un paquete recuperada mediante FEC;
 - duplicados, orden arbitrario y mapa de faltantes;
-- validación de checksum, tamaño y nombre.
+- validación de checksum, SHA-256, tamaño y nombre;
+- rechazo de payload manipulado.
 
 Ejecutar:
 

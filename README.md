@@ -1,6 +1,6 @@
 # Tōna Transfer
 
-PoC de transferencia de archivos binarios de hasta **1.5 MiB** mediante códigos QR animados. El archivo se transporta ópticamente entre pantalla y cámara; no se envía por el backend.
+MVP de transferencia de archivos binarios de hasta **1.5 MiB** mediante códigos QR animados. El archivo se transporta ópticamente entre pantalla y cámara; no se envía por el backend.
 
 ## Separación frontend/backend
 
@@ -79,13 +79,17 @@ La tarea publica `192.168.3.175:30000/tcp` hacia el HTTPS interno del contenedor
 
 El acceso inicial a la página usa la red local, pero el archivo no pasa por ella: la transferencia se realiza mediante luz, Canvas y cámara.
 
+El runtime ejecuta Node y Python como el usuario no privilegiado `tona`, limita memoria a 512 MiB y procesos a 128, elimina capacidades Linux y activa `no-new-privileges`. El servidor publica cabeceras CSP, `Permissions-Policy` para cámara y `X-Content-Type-Options`.
+
 ## Notas del protocolo
 
-La ruta activa usa el protocolo binario `TN2`: Deflate adaptativo (o bytes originales si comprimir no reduce), paquetes QR en modo byte, cabecera compacta, índices y reparaciones XOR FEC. El receptor tolera orden arbitrario, duplicados, paquetes antes de la cabecera y una pérdida por grupo FEC; concatena, descomprime cuando corresponde y valida checksum/tamaño antes de entregar el archivo.
+La ruta activa usa el protocolo binario `TN2`: Deflate adaptativo (o bytes originales si comprimir no reduce), paquetes QR en modo byte, cabecera compacta, índices y reparaciones XOR FEC. El receptor tolera orden arbitrario, duplicados, paquetes antes de la cabecera y una pérdida por grupo FEC; concatena, descomprime cuando corresponde y valida checksum/tamaño más SHA-256 antes de entregar el archivo.
 
 El QR selecciona automáticamente la versión necesaria con corrección `L` o `M`, usa un margen de cuatro módulos y repite cada paquete según el modo seleccionado. La densidad binaria se puede ajustar entre `400–1800` bytes (`600` por defecto) desde la pestaña **Emisor** sin recompilar. La cabecera se emite al inicio, mitad y final de cada ciclo para que el receptor pueda incorporarse tarde o recuperar metadatos.
 
-El receptor expone el nombre y extensión, tamaño, checksum, contador transcurrido y un mapa visual de paquetes: verde significa recibido y rojo faltante. También genera una solicitud óptica `REQUEST|checksum|rangos`; el emisor puede leerla con **Leer solicitud del receptor** y reconstruir su cola para retransmitir solamente esos índices. Si la solicitud no cabe en un QR, se puede escribir el mismo rango manualmente, por ejemplo `0-3,8,10-12`.
+El receptor expone el nombre y extensión, tamaño, checksum, contador transcurrido, velocidad y un mapa visual de paquetes: verde significa recibido y rojo faltante. También genera una solicitud óptica `REQUEST|checksum|rangos`; el emisor puede leerla con **Leer solicitud del receptor** y reconstruir su cola para retransmitir solamente esos índices. Si la solicitud no cabe en un QR, se puede escribir el mismo rango manualmente, por ejemplo `0-3,8,10-12`.
+
+La preparación del archivo se ejecuta en `frontend/packet-worker.js`, dejando libre el hilo principal para el canvas y la cámara. El receptor guarda los paquetes aceptados en IndexedDB y puede restaurar una sesión parcial después de recargar; **Reiniciar recepción** elimina esa sesión local.
 
 ### Compresión y retransmisión
 
@@ -103,7 +107,7 @@ Para esta arquitectura hay dos caminos sólidos:
 1. **Índices + bitmap + FEC + NACK óptico (implementado):** bytes QR, compresión adaptativa, reparaciones XOR, mapa de faltantes y un QR de solicitud que viaja de vuelta desde el receptor al emisor. Es sencillo de inspeccionar, permite reanudar y retransmite sólo lo perdido, pero requiere que el emisor tenga cámara y que ambos dispositivos puedan apuntarse alternativamente.
 2. **Fountain/Raptor simplificado (siguiente evolución):** el emisor transmite combinaciones XOR de bloques con una semilla; el receptor reconstruye cuando obtiene suficientes combinaciones independientes, sin canal de retorno. Tolera mejor pérdidas y movimiento, pero requiere más protocolo, memoria y pruebas matemáticas; ya no se puede mostrar un índice recibido de forma tan directa.
 
-La solución actual conserva la primera alternativa porque es verificable para archivos de hasta 1.5 MiB y permite mostrar exactamente qué paquetes faltan. El contador de tiempo es informativo y se inicia al comenzar la emisión o al activar la cámara.
+La solución actual conserva la primera alternativa porque es verificable para archivos de hasta 1.5 MiB y permite mostrar exactamente qué paquetes faltan. El contador de tiempo es informativo y se inicia al comenzar la emisión o al activar la cámara. La integridad criptográfica usa SHA-256; todavía no se cifra el contenido, por lo que cualquier persona que vea la pantalla puede reconstruir el archivo.
 
 Las optimizaciones de transporte binario, FEC, compresión adaptativa, repetición adaptativa, ROI y `requestVideoFrameCallback` están descritas en [docs/TRANSFER-OPTIMIZATION.md](docs/TRANSFER-OPTIMIZATION.md).
 

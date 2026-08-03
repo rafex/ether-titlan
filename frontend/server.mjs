@@ -21,11 +21,19 @@ const contentTypes = {
   ".png": "image/png",
 };
 
+const securityHeaders = {
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "permissions-policy": "camera=(self), microphone=()",
+  "content-security-policy": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; media-src 'self' blob:",
+};
+
 function sendJson(response, statusCode, body) {
   const payload = JSON.stringify(body);
   response.writeHead(statusCode, {
     "content-type": "application/json; charset=utf-8",
     "content-length": Buffer.byteLength(payload),
+    ...securityHeaders,
   });
   response.end(payload);
 }
@@ -41,7 +49,7 @@ function proxyToBackend(request, response) {
       headers: { ...request.headers, host: target.host },
     },
     (backendResponse) => {
-      response.writeHead(backendResponse.statusCode || 502, backendResponse.headers);
+      response.writeHead(backendResponse.statusCode || 502, { ...backendResponse.headers, ...securityHeaders });
       backendResponse.pipe(response);
     },
   );
@@ -76,6 +84,7 @@ async function serveStatic(request, response) {
       "content-type": contentTypes[path.extname(filePath)] || "application/octet-stream",
       "content-length": fileInfo.size,
       "cache-control": "no-store",
+      ...securityHeaders,
     });
     if (request.method === "HEAD") response.end();
     else createReadStream(filePath).pipe(response);

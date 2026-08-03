@@ -7,7 +7,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install wasm-pack --version 0.15.0 --locked
 COPY --from=node-tools /usr/local/bin/node /usr/local/bin/node
-RUN rustup component add rustfmt
+RUN rustup component add rustfmt clippy
 
 WORKDIR /workspace
 COPY . .

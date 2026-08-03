@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "check": "node --check main.js && node --check server.mjs",
+    "check": "node --check main.js && node --check packet-worker.js && node --check server.mjs",
     "start": "node server.mjs"
   }
 }

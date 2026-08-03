@@ -1,6 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -87,7 +88,7 @@ fn parse_header(packet: &str) -> Option<HeaderMetadata> {
 
     let filename = fields[1].to_string();
     if filename.is_empty()
-        || filename.as_bytes().len() > MAX_FILENAME_BYTES
+        || filename.len() > MAX_FILENAME_BYTES
         || filename.chars().any(|character| character.is_control())
     {
         return None;
@@ -178,7 +179,7 @@ pub fn compress_and_split_with_chunk_size(
 
     if buffer.len() > MAX_FILE_BYTES
         || filename.is_empty()
-        || filename.as_bytes().len() > MAX_FILENAME_BYTES
+        || filename.len() > MAX_FILENAME_BYTES
         || filename
             .chars()
             .any(|character| character == '|' || character.is_control())
@@ -352,7 +353,10 @@ const BINARY_MAGIC: [u8; 3] = *b"TN2";
 const BINARY_HEADER_TYPE: u8 = 0;
 const BINARY_DATA_TYPE: u8 = 1;
 const BINARY_PARITY_TYPE: u8 = 2;
-const BINARY_HEADER_FIXED_BYTES: usize = 31;
+// Header layout: magic(3), type(1), codec(1), FEC(1), flags(1),
+// FNV transfer id(8), SHA-256(32), file size(4), compressed size(4),
+// chunk size(2), data packet count(4), filename length(2).
+const BINARY_HEADER_FIXED_BYTES: usize = 63;
 const BINARY_DATA_FIXED_BYTES: usize = 16;
 const BINARY_MAX_CHUNK_BYTES: usize = 1_800;
 const BINARY_MIN_CHUNK_BYTES: usize = 400;
@@ -362,6 +366,7 @@ const BINARY_MAX_PENDING_PACKETS: usize = 10_000;
 struct BinaryHeader {
     codec: u8,
     checksum: u64,
+    digest: [u8; 32],
     file_size: usize,
     compressed_size: usize,
     chunk_size: usize,
@@ -390,6 +395,7 @@ struct BinaryReceiverInfo {
     file_size: usize,
     compressed_size: usize,
     checksum: Option<String>,
+    sha256: Option<String>,
     codec: String,
     fec_group_size: usize,
     recovered_packets: usize,
@@ -431,6 +437,20 @@ fn binary_compress(buffer: &[u8]) -> Option<(u8, Vec<u8>)> {
     }
 }
 
+fn file_digest(bytes: &[u8], filename: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(filename);
+    digest.update(bytes);
+    digest.finalize().into()
+}
+
+fn bytes_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
 fn binary_header_packet(header: &BinaryHeader) -> Vec<u8> {
     let filename = header.filename.as_bytes();
     let mut packet = Vec::with_capacity(BINARY_HEADER_FIXED_BYTES + filename.len());
@@ -440,6 +460,7 @@ fn binary_header_packet(header: &BinaryHeader) -> Vec<u8> {
     packet.push(header.fec_group_size as u8);
     packet.push(0); // reserved flags
     packet.extend_from_slice(&header.checksum.to_be_bytes());
+    packet.extend_from_slice(&header.digest);
     push_u32(&mut packet, header.file_size);
     push_u32(&mut packet, header.compressed_size);
     push_u16(&mut packet, header.chunk_size);
@@ -459,7 +480,7 @@ fn build_binary_packets(
         || !matches!(fec_group_size, 0 | 8)
         || buffer.len() > MAX_FILE_BYTES
         || filename.is_empty()
-        || filename.as_bytes().len() > MAX_FILENAME_BYTES
+        || filename.len() > MAX_FILENAME_BYTES
         || filename.chars().any(|character| character.is_control())
     {
         return None;
@@ -468,9 +489,11 @@ fn build_binary_packets(
     let (codec, encoded) = binary_compress(buffer)?;
     let data_packets = encoded.len().max(1).div_ceil(chunk_size);
     let checksum = checksum(buffer, filename.as_bytes());
+    let digest = file_digest(buffer, filename.as_bytes());
     let header = BinaryHeader {
         codec,
         checksum,
+        digest,
         file_size: buffer.len(),
         compressed_size: encoded.len(),
         chunk_size,
@@ -559,11 +582,12 @@ fn parse_binary_header(packet: &[u8]) -> Option<BinaryHeader> {
     let codec = packet[4];
     let fec_group_size = packet[5] as usize;
     let checksum = read_u64(packet, 7)?;
-    let file_size = read_u32(packet, 15)?;
-    let compressed_size = read_u32(packet, 19)?;
-    let chunk_size = read_u16(packet, 23)?;
-    let data_packets = read_u32(packet, 25)?;
-    let filename_len = read_u16(packet, 29)?;
+    let digest: [u8; 32] = packet.get(15..47)?.try_into().ok()?;
+    let file_size = read_u32(packet, 47)?;
+    let compressed_size = read_u32(packet, 51)?;
+    let chunk_size = read_u16(packet, 55)?;
+    let data_packets = read_u32(packet, 57)?;
+    let filename_len = read_u16(packet, 61)?;
     let filename_start = BINARY_HEADER_FIXED_BYTES;
     let filename_end = filename_start.checked_add(filename_len)?;
     let filename = String::from_utf8(packet.get(filename_start..filename_end)?.to_vec()).ok()?;
@@ -576,7 +600,7 @@ fn parse_binary_header(packet: &[u8]) -> Option<BinaryHeader> {
         || file_size > MAX_FILE_BYTES
         || compressed_size > MAX_FILE_BYTES * 2
         || filename.is_empty()
-        || filename.as_bytes().len() > MAX_FILENAME_BYTES
+        || filename.len() > MAX_FILENAME_BYTES
         || filename.chars().any(|character| character.is_control())
     {
         return None;
@@ -590,6 +614,7 @@ fn parse_binary_header(packet: &[u8]) -> Option<BinaryHeader> {
     Some(BinaryHeader {
         codec,
         checksum,
+        digest,
         file_size,
         compressed_size,
         chunk_size,
@@ -690,6 +715,7 @@ fn try_binary_assemble(state: &mut BinaryReceiverState) -> Option<Vec<u8>> {
     };
     if file.len() != header.file_size
         || checksum(&file, header.filename.as_bytes()) != header.checksum
+        || file_digest(&file, header.filename.as_bytes()) != header.digest
     {
         return None;
     }
@@ -871,6 +897,7 @@ pub fn binary_receiver_info() -> String {
             file_size: header.file_size,
             compressed_size: header.compressed_size,
             checksum: Some(format!("{:016x}", header.checksum)),
+            sha256: Some(bytes_hex(&header.digest)),
             codec: if header.codec == 1 { "deflate" } else { "raw" }.to_string(),
             fec_group_size: header.fec_group_size,
             recovered_packets: state.recovered_packets,
@@ -1001,5 +1028,20 @@ mod tests {
         let output = process_binary_packet(packets[0].clone()).expect("pending data");
         assert_eq!(output, input);
         assert!(binary_receiver_info().contains("antes.dat"));
+    }
+
+    #[test]
+    fn binary_protocol_rejects_tampered_payload() {
+        let input: Vec<u8> = (0..8_000).map(|value| (value % 251) as u8).collect();
+        let mut packets = build_binary_packets(&input, "integro.bin", 600, 0).expect("packets");
+        packets[1][BINARY_DATA_FIXED_BYTES] ^= 0x80;
+        reset_binary_receiver();
+        process_binary_packet(packets[0].clone());
+        let mut output = None;
+        for packet in packets.iter().skip(1) {
+            output = process_binary_packet(packet.clone()).or(output);
+        }
+        assert!(output.is_none());
+        assert!(binary_receiver_info().contains("\"complete\":false"));
     }
 }

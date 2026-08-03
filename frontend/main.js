@@ -30,6 +30,8 @@ const sender = {
   packetFrames: 0,
   repeatMode: "auto",
   recoveryMode: false,
+  prepareToken: 0,
+  metrics: { frames: 0, packets: 0, bytes: 0 },
   clock: { startedAt: null, elapsedMs: 0, timer: null },
 };
 const receiver = {
@@ -39,6 +41,7 @@ const receiver = {
   lastPacket: "",
   logLines: [],
   stats: { frames: 0, qrDetections: 0, duplicates: 0, packets: 0 },
+  persistenceError: false,
   controlRendering: false,
   controlPayload: "",
   roi: null,
@@ -61,6 +64,50 @@ const senderControlScanContext = senderControlScanCanvas.getContext("2d", { will
 const receiverPacketMapCanvas = $("receiver-packet-map");
 const receiverPacketMapContext = receiverPacketMapCanvas.getContext("2d");
 const receiverControlCanvas = $("receiver-control-canvas");
+const RECEIVER_DB_NAME = "tona-transfer-mvp";
+const RECEIVER_DB_VERSION = 1;
+const RECEIVER_STORE_NAME = "packets";
+let receiverDbPromise = null;
+let packetWorker = null;
+let packetRequestId = 0;
+const packetRequests = new Map();
+
+try {
+  packetWorker = new Worker("./packet-worker.js", { type: "module" });
+  packetWorker.addEventListener("message", (event) => {
+    const request = packetRequests.get(event.data.id);
+    if (!request) return;
+    packetRequests.delete(event.data.id);
+    if (event.data.error) request.reject(new Error(event.data.error));
+    else request.resolve(event.data.packets.map((buffer) => new Uint8Array(buffer)));
+  });
+  packetWorker.addEventListener("error", (event) => {
+    const error = new Error(event.message || "El Worker de preparación terminó inesperadamente.");
+    packetRequests.forEach((request) => request.reject(error));
+    packetRequests.clear();
+  });
+} catch (error) {
+  console.warn("No se pudo crear el Worker de paquetes; se usará WASM en el hilo principal.", error);
+}
+
+function preparePacketsInWorker(buffer, filename, settings) {
+  if (!packetWorker) {
+    return Promise.resolve(Array.from(prepare_binary_packets(
+      new Uint8Array(buffer), filename, settings.chunkBytes, settings.fecGroupSize,
+    ), (packet) => new Uint8Array(packet)));
+  }
+  const id = ++packetRequestId;
+  return new Promise((resolve, reject) => {
+    packetRequests.set(id, { resolve, reject });
+    packetWorker.postMessage({
+      id,
+      buffer,
+      filename,
+      chunkBytes: settings.chunkBytes,
+      fecGroupSize: settings.fecGroupSize,
+    }, [buffer]);
+  });
+}
 
 function setStatus(element, message, isError = false) {
   element.textContent = message;
@@ -93,11 +140,14 @@ function resetClock(clock, elementId) {
   renderClock(clock, elementId);
 }
 
-function startClock(clock, elementId) {
+function startClock(clock, elementId, onTick = undefined) {
   if (clock.startedAt !== null) return;
   clock.startedAt = performance.now();
   renderClock(clock, elementId);
-  clock.timer = setInterval(() => renderClock(clock, elementId), 250);
+  clock.timer = setInterval(() => {
+    renderClock(clock, elementId);
+    onTick?.();
+  }, 250);
 }
 
 function pauseClock(clock, elementId) {
@@ -119,6 +169,107 @@ function receiverLog(message, details = undefined) {
   if (debug) debug.textContent = receiver.logLines.join("\n");
   if (details) console.info(`[Tōna receiver] ${message}`, details);
   else console.info(`[Tōna receiver] ${message}`);
+}
+
+function formatRate(bytesPerSecond) {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return "—";
+  if (bytesPerSecond >= 1024 * 1024) return `${(bytesPerSecond / 1024 / 1024).toFixed(2)} MiB/s`;
+  return `${(bytesPerSecond / 1024).toFixed(1)} KiB/s`;
+}
+
+function updateSenderMetrics() {
+  const elapsed = Math.max(clockValue(sender.clock) / 1000, 0.001);
+  const packetsPerSecond = sender.metrics.packets / elapsed;
+  $("sender-metrics").textContent = `Rendimiento: ${formatRate(sender.metrics.bytes / elapsed)} · ${packetsPerSecond.toFixed(1)} QR/s · frames de emisión ${sender.metrics.frames}`;
+}
+
+function updateReceiverMetrics() {
+  const elapsed = Math.max(clockValue(receiver.clock) / 1000, 0.001);
+  const info = JSON.parse(binary_receiver_info() || "{}");
+  const receivedBytes = info.file_size && info.total_packets
+    ? info.file_size * (info.received_packets / info.total_packets)
+    : 0;
+  const detectionRate = receiver.stats.qrDetections / elapsed;
+  $("receiver-metrics").textContent = `Rendimiento: ${formatRate(receivedBytes / elapsed)} · detecciones ${detectionRate.toFixed(1)}/s · frames ${receiver.stats.frames} · duplicados ${receiver.stats.duplicates}`;
+}
+
+function receiverPacketKey(packet) {
+  const type = packet?.[3];
+  const transfer = packetChecksum(packet);
+  if (type === 0) return `header:${transfer}`;
+  if ((type === 1 || type === 2) && packet.length >= 16) {
+    const index = new DataView(packet.buffer, packet.byteOffset, packet.byteLength).getUint32(12);
+    return `${type === 1 ? "data" : "parity"}:${transfer}:${index}`;
+  }
+  return `packet:${transfer}:${packet.length}`;
+}
+
+function openReceiverDb() {
+  if (!window.indexedDB) return Promise.resolve(null);
+  if (receiverDbPromise) return receiverDbPromise;
+  receiverDbPromise = new Promise((resolve, reject) => {
+    const request = window.indexedDB.open(RECEIVER_DB_NAME, RECEIVER_DB_VERSION);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(RECEIVER_STORE_NAME, { keyPath: "key" });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("No se pudo abrir IndexedDB"));
+  });
+  return receiverDbPromise;
+}
+
+async function persistReceiverPacket(packet) {
+  try {
+    const db = await openReceiverDb();
+    if (!db) return;
+    const transaction = db.transaction(RECEIVER_STORE_NAME, "readwrite");
+    transaction.objectStore(RECEIVER_STORE_NAME).put({
+      key: receiverPacketKey(packet),
+      packet: packet.slice().buffer,
+      savedAt: Date.now(),
+    });
+  } catch (error) {
+    if (!receiver.persistenceError) {
+      receiver.persistenceError = true;
+      receiverLog("No se pudo guardar la sesión local", { message: error.message });
+    }
+  }
+}
+
+async function restoreReceiverSession() {
+  try {
+    const db = await openReceiverDb();
+    if (!db) return null;
+    const records = await new Promise((resolve, reject) => {
+      const request = db.transaction(RECEIVER_STORE_NAME, "readonly").objectStore(RECEIVER_STORE_NAME).getAll();
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => reject(request.error || new Error("No se pudo leer la sesión local"));
+    });
+    let assembled = null;
+    for (const record of records) {
+      assembled = process_binary_packet(new Uint8Array(record.packet)) || assembled;
+    }
+    if (records.length) receiverLog("Sesión local restaurada", { packets: records.length });
+    return assembled;
+  } catch (error) {
+    receiverLog("No se pudo restaurar la sesión local", { message: error.message });
+    return null;
+  }
+}
+
+async function clearReceiverSessionStore() {
+  try {
+    const db = await openReceiverDb();
+    if (!db) return;
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(RECEIVER_STORE_NAME, "readwrite");
+      transaction.objectStore(RECEIVER_STORE_NAME).clear();
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error("No se pudo limpiar la sesión local"));
+    });
+  } catch (error) {
+    receiverLog("No se pudo limpiar la sesión local", { message: error.message });
+  }
 }
 
 function qrSettings() {
@@ -203,6 +354,7 @@ function updateSenderProgress() {
   const selected = sender.selectedDataIndexes ? sender.selectedDataIndexes.length : totalData;
   const parity = sender.selectedDataIndexes ? 0 : senderParityPacketCount();
   $("sender-packet-meta").innerHTML = `Datos: ${selected} de ${totalData} · reparación FEC: ${parity} · tiempo: <time id="sender-elapsed">${formatElapsed(clockValue(sender.clock))}</time>`;
+  updateSenderMetrics();
 }
 
 function allSenderDataIndexes() {
@@ -288,6 +440,7 @@ function updateReceiverProgress() {
   $("receiver-missing-label").textContent = visibleMissing ? `Faltantes: ${visibleMissing}` : (total ? "Faltantes: ninguno" : "Faltantes: —");
   drawReceiverPacketMap(binary_receiver_packet_map());
   updateReceiverControlQr();
+  updateReceiverMetrics();
 }
 
 function drawReceiverPacketMap(packetMap) {
@@ -348,13 +501,37 @@ function updateReceiverControlQr() {
 
 function stopSender() {
   sender.running = false;
+  if (sender.frame) cancelAnimationFrame(sender.frame);
   sender.frame = null;
   sender.rendering = false;
   sender.packetRendered = false;
   sender.packetFrames = 0;
   pauseClock(sender.clock, "sender-elapsed");
   $("start-sender").disabled = !sender.packets.length;
+  $("start-sender").textContent = sender.packets.length ? "Reanudar emisión" : "Iniciar emisión";
   $("stop-sender").disabled = true;
+  $("reset-sender").disabled = !sender.packets.length;
+  if (sender.packets.length) setStatus($("sender-file"), `${sender.file.name} — emisión en pausa.`);
+}
+
+function resetSender() {
+  sender.prepareToken += 1;
+  stopSender();
+  sender.packets = [];
+  sender.metadata = null;
+  sender.queue = [];
+  sender.file = null;
+  sender.selectedDataIndexes = null;
+  sender.recoveryMode = false;
+  sender.metrics = { frames: 0, packets: 0, bytes: 0 };
+  $("file-input").value = "";
+  $("sender-missing-ranges").value = "";
+  $("start-sender").disabled = true;
+  $("reset-sender").disabled = true;
+  const context = senderCanvas.getContext("2d");
+  context.clearRect(0, 0, senderCanvas.width, senderCanvas.height);
+  setStatus($("sender-file"), "Ningún archivo seleccionado.");
+  updateSenderProgress();
 }
 
 function renderSenderFrame() {
@@ -365,9 +542,13 @@ function renderSenderFrame() {
   if (sender.packetRendered) {
     sender.packetFrames += 1;
     if (sender.packetFrames < holdFramesFor(sender.queue[sender.index])) return;
+    const renderedEntry = sender.queue[sender.index];
     sender.packetRendered = false;
     sender.packetFrames = 0;
     sender.index = (sender.index + 1) % sender.queue.length;
+    sender.metrics.frames += 1;
+    sender.metrics.packets += 1;
+    sender.metrics.bytes += renderedEntry?.payload?.length || 0;
     updateSenderProgress();
   }
 
@@ -388,25 +569,27 @@ function renderSenderFrame() {
 
 function startSender() {
   if (!sender.packets.length) return;
-  buildSenderQueue();
+  if (!sender.queue.length) buildSenderQueue();
   sender.running = true;
-  sender.index = 0;
   sender.packetRendered = false;
   sender.packetFrames = 0;
   $("start-sender").disabled = true;
   $("stop-sender").disabled = false;
-  startClock(sender.clock, "sender-elapsed");
+  startClock(sender.clock, "sender-elapsed", updateSenderMetrics);
+  $("start-sender").textContent = "Reanudar emisión";
   setStatus($("sender-file"), `${sender.file.name} — emisión activa, QR repetido para captura móvil.`);
   renderSenderFrame();
 }
 
 async function loadFile(file) {
+  const prepareToken = ++sender.prepareToken;
   stopSender();
   sender.packets = [];
   sender.metadata = null;
   sender.queue = [];
   sender.selectedDataIndexes = null;
   sender.recoveryMode = false;
+  sender.metrics = { frames: 0, packets: 0, bytes: 0 };
   sender.file = null;
   resetClock(sender.clock, "sender-elapsed");
   $("sender-missing-ranges").value = "";
@@ -420,26 +603,34 @@ async function loadFile(file) {
 
   try {
     const buffer = await file.arrayBuffer();
+    const fallbackBuffer = buffer.slice(0);
     const settings = qrSettings();
-    sender.packets = Array.from(prepare_binary_packets(
-      new Uint8Array(buffer),
-      file.name,
-      settings.chunkBytes,
-      settings.fecGroupSize,
-    ), (packet) => new Uint8Array(packet));
+    setStatus($("sender-file"), `${file.name} — preparando paquetes en segundo plano…`);
+    let packets;
+    try {
+      packets = await preparePacketsInWorker(buffer, file.name, settings);
+    } catch (error) {
+      console.warn("Worker de paquetes no disponible; usando fallback síncrono.", error);
+      packets = Array.from(prepare_binary_packets(
+        new Uint8Array(fallbackBuffer), file.name, settings.chunkBytes, settings.fecGroupSize,
+      ), (packet) => new Uint8Array(packet));
+    }
+    if (prepareToken !== sender.prepareToken) return;
+    sender.packets = packets;
     if (!sender.packets.length) throw new Error("WASM rechazó el archivo o el nombre es demasiado largo.");
     sender.file = file;
     const header = sender.packets[0];
     sender.metadata = {
       checksum: packetChecksum(header),
-      dataPackets: new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(25),
-      chunkBytes: new DataView(header.buffer, header.byteOffset, header.byteLength).getUint16(23),
+      dataPackets: new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(57),
+      chunkBytes: new DataView(header.buffer, header.byteOffset, header.byteLength).getUint16(55),
       fecGroupSize: header[5],
       parityPackets: sender.packets.filter((packet) => packetType(packet) === 2).length,
       codec: header[4] === 1 ? "deflate" : "raw",
     };
     buildSenderQueue();
     $("start-sender").disabled = false;
+    $("reset-sender").disabled = false;
     setStatus($("sender-file"), `${file.name} — ${(file.size / 1024).toFixed(1)} KiB listo con ${sender.metadata.dataPackets} paquetes binarios de ${settings.chunkBytes} bytes (${sender.metadata.codec}).`);
     updateSenderProgress();
   } catch (error) {
@@ -647,6 +838,7 @@ function finishDownload(bytes) {
   link.textContent = `Descargar ${filename}`;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  clearReceiverSessionStore();
   setStatus($("receiver-status"), `Transferencia completa: ${filename}.`);
   updateReceiverProgress();
 }
@@ -777,7 +969,9 @@ function scanReceiverFrame() {
     detections: receiver.stats.qrDetections,
   });
   try {
-    const assembled = process_binary_packet(new Uint8Array(code.binaryData));
+    const packet = new Uint8Array(code.binaryData);
+    const assembled = process_binary_packet(packet);
+    persistReceiverPacket(packet);
     receiver.stats.packets += 1;
     updateReceiverProgress();
     receiverLog("Paquete enviado a WASM", {
@@ -789,6 +983,22 @@ function scanReceiverFrame() {
     receiverLog("WASM rechazó el paquete", { message: error.message });
     setStatus($("receiver-status"), `Paquete inválido: ${error.message}`, true);
   }
+}
+
+async function resetReceiverSession() {
+  stopReceiver();
+  reset_binary_receiver();
+  receiver.lastPacket = "";
+  receiver.roi = null;
+  receiver.roiMisses = 0;
+  receiver.logLines = [];
+  receiver.stats = { frames: 0, qrDetections: 0, duplicates: 0, packets: 0 };
+  receiver.persistenceError = false;
+  resetClock(receiver.clock, "receiver-elapsed");
+  await clearReceiverSessionStore();
+  $("download-link").hidden = true;
+  $("receiver-status").textContent = "Recepción reiniciada.";
+  updateReceiverProgress();
 }
 
 async function startReceiver() {
@@ -822,6 +1032,12 @@ async function startReceiver() {
     reset_binary_receiver();
     receiver.lastPacket = "";
     updateReceiverProgress();
+    const restored = await restoreReceiverSession();
+    updateReceiverProgress();
+    if (restored) {
+      finishDownload(restored);
+      return;
+    }
     receiver.stream = await openReceiverCamera();
     const video = $("receiver-video");
     video.srcObject = receiver.stream;
@@ -849,7 +1065,7 @@ async function startReceiver() {
       }
     }
     receiver.running = true;
-    startClock(receiver.clock, "receiver-elapsed");
+    startClock(receiver.clock, "receiver-elapsed", updateReceiverMetrics);
     $("start-receiver").disabled = true;
     $("stop-receiver").disabled = false;
     setStatus($("receiver-status"), "Cámara activa. Buscando paquetes…");
@@ -880,6 +1096,7 @@ $("drop-zone").addEventListener("drop", (event) => {
 });
 $("start-sender").addEventListener("click", startSender);
 $("stop-sender").addEventListener("click", stopSender);
+$("reset-sender").addEventListener("click", resetSender);
 $("apply-missing").addEventListener("click", () => {
   try {
     applyMissingSelection($("sender-missing-ranges").value);
@@ -898,6 +1115,7 @@ $("start-sender-control").addEventListener("click", startSenderControl);
 $("stop-sender-control").addEventListener("click", stopSenderControl);
 $("start-receiver").addEventListener("click", startReceiver);
 $("stop-receiver").addEventListener("click", stopReceiver);
+$("reset-receiver").addEventListener("click", () => { resetReceiverSession(); });
 document.querySelectorAll(".tab").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tab)));
 $("qr-chunk-size").addEventListener("input", updateQrSettingsLabel);
 $("qr-chunk-size").addEventListener("change", () => {
@@ -916,7 +1134,12 @@ $("qr-repeat-mode").addEventListener("change", () => {
   updateQrSettingsLabel();
 });
 updateQrSettingsLabel();
-window.addEventListener("beforeunload", () => { stopSender(); stopSenderControl(); stopReceiver(); });
+window.addEventListener("beforeunload", () => {
+  stopSender();
+  stopSenderControl();
+  stopReceiver();
+  packetWorker?.terminate();
+});
 
 try {
   await init();
