@@ -13,7 +13,9 @@ const MIN_DATA_CHUNK_CHARS: usize = 300;
 const MAX_DATA_CHUNK_CHARS: usize = 1_500;
 const MAX_FILENAME_BYTES: usize = 255;
 const MAX_FILE_BYTES: usize = 1_500 * 1024;
-const MAX_TOTAL_PACKETS: usize = MAX_FILE_BYTES / MIN_DATA_CHUNK_CHARS + 2;
+// A 1.5 MiB incompressible file expands by roughly 4/3 in Base64. Keep a
+// bounded headroom for Deflate framing and reject hostile, unbounded headers.
+const MAX_TOTAL_PACKETS: usize = 10_000;
 
 #[derive(Clone, Debug)]
 struct HeaderMetadata {
