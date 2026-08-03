@@ -29,6 +29,9 @@
       progress { width: 100%; height: 12px; accent-color: #36b37e; }
       #sender-canvas { display: block; width: min(80vw, 640px); height: min(80vw, 640px); margin: 18px auto 4px; background: white; image-rendering: pixelated; }
       #receiver-video { display: block; width: min(100%, 560px); max-height: 55vh; margin: 16px auto; border-radius: 12px; background: #05070c; object-fit: cover; }
+      .diagnostics { margin-top: 16px; color: #a7b4c9; }
+      .diagnostics summary { cursor: pointer; }
+      .diagnostics pre { max-height: 180px; overflow: auto; padding: 10px; border-radius: 8px; background: #080d18; color: #bfe3ff; font: .75rem ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
       .small { font-size: .9rem; }
       code { color: #bfe3ff; }
     </style>
@@ -78,6 +81,10 @@
           <progress id="receiver-progress" value="0" max="1"></progress>
           <p id="receiver-progress-label" class="small">Paquetes recibidos: 0 de 0</p>
         </div>
+        <details class="diagnostics">
+          <summary>Diagnóstico del receptor</summary>
+          <pre id="receiver-debug">Sin iniciar.</pre>
+        </details>
         <a id="download-link" hidden></a>
       </section>
     </main>

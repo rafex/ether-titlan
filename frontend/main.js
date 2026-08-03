@@ -28,7 +28,14 @@ const sender = {
   packetRendered: false,
   packetFrames: 0,
 };
-const receiver = { stream: null, frame: null, running: false, lastPacket: "" };
+const receiver = {
+  stream: null,
+  frame: null,
+  running: false,
+  lastPacket: "",
+  logLines: [],
+  stats: { frames: 0, qrDetections: 0, duplicates: 0, packets: 0 },
+};
 
 const senderCanvas = $("sender-canvas");
 const scanCanvas = $("scan-canvas");
@@ -37,6 +44,17 @@ const scanContext = scanCanvas.getContext("2d", { willReadFrequently: true });
 function setStatus(element, message, isError = false) {
   element.textContent = message;
   element.classList.toggle("error", isError);
+}
+
+function receiverLog(message, details = undefined) {
+  const suffix = details ? ` ${JSON.stringify(details)}` : "";
+  const line = `${new Date().toISOString()} ${message}${suffix}`;
+  receiver.logLines.push(line);
+  receiver.logLines = receiver.logLines.slice(-12);
+  const debug = $("receiver-debug");
+  if (debug) debug.textContent = receiver.logLines.join("\n");
+  if (details) console.info(`[Tōna receiver] ${message}`, details);
+  else console.info(`[Tōna receiver] ${message}`);
 }
 
 async function checkBackend() {
@@ -151,6 +169,7 @@ function stopReceiver() {
   $("receiver-video").srcObject = null;
   $("start-receiver").disabled = false;
   $("stop-receiver").disabled = true;
+  receiverLog("Cámara detenida");
 }
 
 function finishDownload(bytes) {
@@ -170,8 +189,16 @@ function finishDownload(bytes) {
 function scanReceiverFrame() {
   if (!receiver.running) return;
   receiver.frame = requestAnimationFrame(scanReceiverFrame);
+  receiver.stats.frames += 1;
   const video = $("receiver-video");
-  if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth) return;
+  if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth) {
+    if (receiver.stats.frames % 60 === 0) receiverLog("Esperando frame de vídeo", {
+      readyState: video.readyState,
+      videoWidth: video.videoWidth,
+      videoHeight: video.videoHeight,
+    });
+    return;
+  }
 
   const scale = Math.min(1, MAX_SCAN_WIDTH / video.videoWidth);
   const width = Math.max(640, Math.round(video.videoWidth * scale));
@@ -183,15 +210,45 @@ function scanReceiverFrame() {
   scanContext.imageSmoothingEnabled = false;
   scanContext.drawImage(video, 0, 0, width, height);
   const image = scanContext.getImageData(0, 0, width, height);
-  const code = window.jsQR?.(image.data, image.width, image.height, { inversionAttempts: "attemptBoth" });
-  if (!code?.data || code.data === receiver.lastPacket) return;
+  let code;
+  try {
+    code = window.jsQR(image.data, image.width, image.height, { inversionAttempts: "attemptBoth" });
+  } catch (error) {
+    receiverLog("jsQR lanzó una excepción", { message: error.message });
+    return;
+  }
+  if (!code?.data) {
+    if (receiver.stats.frames % 60 === 0) receiverLog("Sin QR detectado", {
+      frames: receiver.stats.frames,
+      video: `${video.videoWidth}x${video.videoHeight}`,
+      scan: `${width}x${height}`,
+    });
+    return;
+  }
+
+  receiver.stats.qrDetections += 1;
+  if (code.data === receiver.lastPacket) {
+    receiver.stats.duplicates += 1;
+    return;
+  }
 
   receiver.lastPacket = code.data;
+  receiverLog("QR detectado", {
+    length: code.data.length,
+    prefix: code.data.slice(0, 20),
+    detections: receiver.stats.qrDetections,
+  });
   try {
     const assembled = process_packet(code.data);
+    receiver.stats.packets += 1;
     updateReceiverProgress();
+    receiverLog("Paquete enviado a WASM", {
+      packets: receiver.stats.packets,
+      progress: $("receiver-progress-label").textContent,
+    });
     if (assembled !== null && assembled !== undefined) finishDownload(assembled);
   } catch (error) {
+    receiverLog("WASM rechazó el paquete", { message: error.message });
     setStatus($("receiver-status"), `Paquete inválido: ${error.message}`, true);
   }
 }
@@ -206,6 +263,9 @@ async function startReceiver() {
     return;
   }
   try {
+    receiver.logLines = [];
+    receiver.stats = { frames: 0, qrDetections: 0, duplicates: 0, packets: 0 };
+    receiverLog("Solicitando cámara");
     reset_receiver();
     receiver.lastPacket = "";
     updateReceiverProgress();
@@ -221,6 +281,22 @@ async function startReceiver() {
     const video = $("receiver-video");
     video.srcObject = receiver.stream;
     await video.play();
+    const track = receiver.stream.getVideoTracks()[0];
+    const settings = track?.getSettings?.() || {};
+    const capabilities = track?.getCapabilities?.() || {};
+    receiverLog("Cámara activa", {
+      label: track?.label || "desconocida",
+      settings,
+      focusModes: capabilities.focusMode || [],
+    });
+    if (capabilities.focusMode?.includes("continuous")) {
+      try {
+        await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+        receiverLog("Enfoque continuo solicitado");
+      } catch (error) {
+        receiverLog("No se pudo aplicar enfoque continuo", { message: error.message });
+      }
+    }
     receiver.running = true;
     $("start-receiver").disabled = true;
     $("stop-receiver").disabled = false;

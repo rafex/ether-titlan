@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use wasm_bindgen::prelude::*;
 
-const DATA_CHUNK_CHARS: usize = 1_500;
+// The QR payload must remain readable after the camera downsizes the screen.
+// 1,500 characters worked as a transport limit but was too dense in practice.
+const DATA_CHUNK_CHARS: usize = 900;
 const MAX_FILENAME_BYTES: usize = 255;
 const MAX_FILE_BYTES: usize = 1_500 * 1024;
 

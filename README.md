@@ -81,6 +81,6 @@ El acceso inicial a la página usa la red local, pero el archivo no pasa por ell
 
 ## Notas del protocolo
 
-Rust comprime el archivo con Deflate antes de codificarlo como Base64. Después lo divide en trozos de 1,500 caracteres y genera una cabecera `METADATA|nombre|total|checksum|tamaño`; cada dato se identifica con `DATA|checksum|índice|trozo`. El receptor tolera orden arbitrario, duplicados y pérdida de fotogramas, concatena los trozos, descomprime y valida checksum/tamaño antes de entregar el archivo.
+Rust comprime el archivo con Deflate antes de codificarlo como Base64. Después lo divide en trozos prácticos de 900 caracteres para cámaras móviles y genera una cabecera `METADATA|nombre|total|checksum|tamaño`; cada dato se identifica con `DATA|checksum|índice|trozo`. El receptor tolera orden arbitrario, duplicados y pérdida de fotogramas, concatena los trozos, descomprime y valida checksum/tamaño antes de entregar el archivo.
 
 El QR selecciona automáticamente la versión necesaria con corrección `M`, usa un margen de cuatro módulos y repite cada paquete durante varios fotogramas para mejorar la captura móvil.
