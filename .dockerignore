@@ -1,0 +1,6 @@
+.git
+target
+pkg
+node_modules
+*.crt
+*.key

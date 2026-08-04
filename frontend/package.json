@@ -1,0 +1,14 @@
+{
+  "name": "tona-transfer-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Node.js HTTPS host for the Tōna Transfer frontend",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node --check main.js && node --check packet-worker.js && node --check server.mjs",
+    "start": "node server.mjs"
+  }
+}

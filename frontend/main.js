@@ -1,0 +1,1240 @@
+import init, {
+  binary_receiver_control_packet,
+  binary_receiver_filename,
+  binary_receiver_info,
+  binary_receiver_missing_ranges,
+  binary_receiver_packet_map,
+  binary_receiver_progress,
+  fountain_receiver_info,
+  fountain_receiver_missing_ranges,
+  fountain_receiver_packet_map,
+  fountain_receiver_progress,
+  prepare_binary_packets,
+  prepare_fountain_packets,
+  process_binary_packet,
+  process_fountain_packet,
+  reset_binary_receiver,
+  reset_fountain_receiver,
+} from "./pkg/qr_file_transfer.js";
+
+const MAX_FILE_BYTES = 1.5 * 1024 * 1024;
+const QR_SIZE = 640;
+const DEFAULT_CHUNK_BYTES = 800;
+const MAX_SCAN_WIDTH = 1280;
+
+const $ = (id) => document.getElementById(id);
+const sender = {
+  packets: [],
+  metadata: null,
+  queue: [],
+  selectedDataIndexes: null,
+  file: null,
+  frame: null,
+  index: 0,
+  rendering: false,
+  running: false,
+  packetRendered: false,
+  packetFrames: 0,
+  repeatMode: "auto",
+  recoveryMode: false,
+  strategy: "indexed",
+  prepareToken: 0,
+  metrics: { frames: 0, packets: 0, bytes: 0 },
+  clock: { startedAt: null, elapsedMs: 0, timer: null },
+};
+const receiver = {
+  stream: null,
+  frame: null,
+  running: false,
+  lastPacket: "",
+  logLines: [],
+  stats: { frames: 0, qrDetections: 0, duplicates: 0, packets: 0 },
+  persistenceError: false,
+  strategy: "indexed",
+  controlRendering: false,
+  controlPayload: "",
+  roi: null,
+  roiMisses: 0,
+  scanWithVideoFrameCallback: false,
+  clock: { startedAt: null, elapsedMs: 0, timer: null },
+};
+const senderControl = {
+  stream: null,
+  frame: null,
+  running: false,
+  lastRequest: "",
+};
+
+const senderCanvas = $("sender-canvas");
+const scanCanvas = $("scan-canvas");
+const scanContext = scanCanvas.getContext("2d", { willReadFrequently: true });
+const senderControlScanCanvas = $("sender-control-scan-canvas");
+const senderControlScanContext = senderControlScanCanvas.getContext("2d", { willReadFrequently: true });
+const receiverPacketMapCanvas = $("receiver-packet-map");
+const receiverPacketMapContext = receiverPacketMapCanvas.getContext("2d");
+const receiverControlCanvas = $("receiver-control-canvas");
+const RECEIVER_DB_NAME = "tona-transfer-sessions-v2";
+const RECEIVER_DB_VERSION = 1;
+const RECEIVER_STORE_NAME = "packets";
+let receiverDbPromise = null;
+let packetWorker = null;
+let packetRequestId = 0;
+const packetRequests = new Map();
+
+try {
+  packetWorker = new Worker("./packet-worker.js", { type: "module" });
+  packetWorker.addEventListener("message", (event) => {
+    const request = packetRequests.get(event.data.id);
+    if (!request) return;
+    packetRequests.delete(event.data.id);
+    if (event.data.error) request.reject(new Error(event.data.error));
+    else request.resolve(event.data.packets.map((buffer) => new Uint8Array(buffer)));
+  });
+  packetWorker.addEventListener("error", (event) => {
+    const error = new Error(event.message || "El Worker de preparación terminó inesperadamente.");
+    packetRequests.forEach((request) => request.reject(error));
+    packetRequests.clear();
+  });
+} catch (error) {
+  console.warn("No se pudo crear el Worker de paquetes; se usará WASM en el hilo principal.", error);
+}
+
+function preparePacketsInWorker(buffer, filename, settings) {
+  if (!packetWorker) {
+    const prepare = settings.strategy === "fountain" ? prepare_fountain_packets : prepare_binary_packets;
+    const option = settings.strategy === "fountain" ? settings.fountainOverhead : settings.fecGroupSize;
+    return Promise.resolve(Array.from(prepare(
+      new Uint8Array(buffer), filename, settings.chunkBytes, option,
+    ), (packet) => new Uint8Array(packet)));
+  }
+  const id = ++packetRequestId;
+  return new Promise((resolve, reject) => {
+    packetRequests.set(id, { resolve, reject });
+    packetWorker.postMessage({
+      id,
+      buffer,
+      filename,
+      chunkBytes: settings.chunkBytes,
+      fecGroupSize: settings.fecGroupSize,
+      fountainOverhead: settings.fountainOverhead,
+      strategy: settings.strategy,
+    }, [buffer]);
+  });
+}
+
+function setStatus(element, message, isError = false) {
+  element.textContent = message;
+  element.classList.toggle("error", isError);
+}
+
+function formatElapsed(milliseconds) {
+  const totalSeconds = Math.floor(milliseconds / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return hours > 0
+    ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function clockValue(clock) {
+  return clock.startedAt === null ? clock.elapsedMs : clock.elapsedMs + performance.now() - clock.startedAt;
+}
+
+function renderClock(clock, elementId) {
+  $(elementId).textContent = formatElapsed(clockValue(clock));
+}
+
+function resetClock(clock, elementId) {
+  if (clock.timer) clearInterval(clock.timer);
+  clock.timer = null;
+  clock.startedAt = null;
+  clock.elapsedMs = 0;
+  renderClock(clock, elementId);
+}
+
+function startClock(clock, elementId, onTick = undefined) {
+  if (clock.startedAt !== null) return;
+  clock.startedAt = performance.now();
+  renderClock(clock, elementId);
+  clock.timer = setInterval(() => {
+    renderClock(clock, elementId);
+    onTick?.();
+  }, 250);
+}
+
+function pauseClock(clock, elementId) {
+  if (clock.startedAt !== null) {
+    clock.elapsedMs += performance.now() - clock.startedAt;
+    clock.startedAt = null;
+  }
+  if (clock.timer) clearInterval(clock.timer);
+  clock.timer = null;
+  renderClock(clock, elementId);
+}
+
+function receiverLog(message, details = undefined) {
+  const suffix = details ? ` ${JSON.stringify(details)}` : "";
+  const line = `${new Date().toISOString()} ${message}${suffix}`;
+  receiver.logLines.push(line);
+  receiver.logLines = receiver.logLines.slice(-12);
+  const debug = $("receiver-debug");
+  if (debug) debug.textContent = receiver.logLines.join("\n");
+  if (details) console.info(`[Tōna receiver] ${message}`, details);
+  else console.info(`[Tōna receiver] ${message}`);
+}
+
+function formatRate(bytesPerSecond) {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return "—";
+  if (bytesPerSecond >= 1024 * 1024) return `${(bytesPerSecond / 1024 / 1024).toFixed(2)} MiB/s`;
+  return `${(bytesPerSecond / 1024).toFixed(1)} KiB/s`;
+}
+
+function updateSenderMetrics() {
+  const elapsed = Math.max(clockValue(sender.clock) / 1000, 0.001);
+  const packetsPerSecond = sender.metrics.packets / elapsed;
+  $("sender-metrics").textContent = `Rendimiento: ${formatRate(sender.metrics.bytes / elapsed)} · ${packetsPerSecond.toFixed(1)} QR/s · frames de emisión ${sender.metrics.frames}`;
+}
+
+function updateReceiverMetrics() {
+  const elapsed = Math.max(clockValue(receiver.clock) / 1000, 0.001);
+  const info = transferReceiverInfo();
+  const receivedBytes = info.file_size && info.total_packets
+    ? info.file_size * (info.received_packets / info.total_packets)
+    : 0;
+  const detectionRate = receiver.stats.qrDetections / elapsed;
+  $("receiver-metrics").textContent = `Rendimiento: ${formatRate(receivedBytes / elapsed)} · detecciones ${detectionRate.toFixed(1)}/s · frames ${receiver.stats.frames} · duplicados ${receiver.stats.duplicates}`;
+}
+
+function transferReceiverInfo() {
+  return JSON.parse((receiver.strategy === "fountain" ? fountain_receiver_info() : binary_receiver_info()) || "{}");
+}
+
+function transferReceiverProgress() {
+  return receiver.strategy === "fountain" ? fountain_receiver_progress() : binary_receiver_progress();
+}
+
+function transferReceiverMap() {
+  return receiver.strategy === "fountain" ? fountain_receiver_packet_map() : binary_receiver_packet_map();
+}
+
+function transferReceiverMissingRanges() {
+  return receiver.strategy === "fountain" ? fountain_receiver_missing_ranges() : binary_receiver_missing_ranges();
+}
+
+function processTransferPacket(packet) {
+  receiver.strategy = packetMagic(packet);
+  return receiver.strategy === "fountain"
+    ? process_fountain_packet(packet)
+    : process_binary_packet(packet);
+}
+
+function receiverPacketKey(packet) {
+  const type = packet?.[3];
+  const transfer = packetChecksum(packet);
+  const identity = Array.from(packet.slice(12, 28)).join(",");
+  return `${type}:${transfer}:${identity}:${packet.length}`;
+}
+
+function openReceiverDb() {
+  if (!window.indexedDB) return Promise.resolve(null);
+  if (receiverDbPromise) return receiverDbPromise;
+  receiverDbPromise = new Promise((resolve, reject) => {
+    const request = window.indexedDB.open(RECEIVER_DB_NAME, RECEIVER_DB_VERSION);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(RECEIVER_STORE_NAME, { keyPath: "key" });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("No se pudo abrir IndexedDB"));
+  });
+  return receiverDbPromise;
+}
+
+async function persistReceiverPacket(packet) {
+  try {
+    const db = await openReceiverDb();
+    if (!db) return;
+    const transaction = db.transaction(RECEIVER_STORE_NAME, "readwrite");
+    transaction.objectStore(RECEIVER_STORE_NAME).put({
+      key: receiverPacketKey(packet),
+      packet: packet.slice().buffer,
+      savedAt: Date.now(),
+    });
+  } catch (error) {
+    if (!receiver.persistenceError) {
+      receiver.persistenceError = true;
+      receiverLog("No se pudo guardar la sesión local", { message: error.message });
+    }
+  }
+}
+
+async function restoreReceiverSession() {
+  try {
+    const db = await openReceiverDb();
+    if (!db) return null;
+    const records = await new Promise((resolve, reject) => {
+      const request = db.transaction(RECEIVER_STORE_NAME, "readonly").objectStore(RECEIVER_STORE_NAME).getAll();
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => reject(request.error || new Error("No se pudo leer la sesión local"));
+    });
+    let assembled = null;
+    for (const record of records) {
+      assembled = processTransferPacket(new Uint8Array(record.packet)) || assembled;
+    }
+    if (records.length) receiverLog("Sesión local restaurada", { packets: records.length });
+    return assembled;
+  } catch (error) {
+    receiverLog("No se pudo restaurar la sesión local", { message: error.message });
+    return null;
+  }
+}
+
+async function clearReceiverSessionStore() {
+  try {
+    const db = await openReceiverDb();
+    if (!db) return;
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(RECEIVER_STORE_NAME, "readwrite");
+      transaction.objectStore(RECEIVER_STORE_NAME).clear();
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error("No se pudo limpiar la sesión local"));
+    });
+  } catch (error) {
+    receiverLog("No se pudo limpiar la sesión local", { message: error.message });
+  }
+}
+
+function qrSettings() {
+  return {
+    strategy: $("transfer-strategy").value,
+    chunkBytes: Number($("qr-chunk-size").value),
+    fecGroupSize: Number($("qr-fec-group").value),
+    fountainOverhead: Number($("fountain-overhead").value),
+    repeatMode: $("qr-repeat-mode").value,
+    errorCorrectionLevel: $("qr-error-correction").value,
+  };
+}
+
+function qrOptions() {
+  return {
+    errorCorrectionLevel: qrSettings().errorCorrectionLevel,
+    margin: 4,
+    width: QR_SIZE,
+    color: { dark: "#000000", light: "#ffffff" },
+  };
+}
+
+function updateQrSettingsLabel() {
+  const settings = qrSettings();
+  const readability = settings.chunkBytes <= 800 ? "alta" : settings.chunkBytes <= 1200 ? "media" : "baja";
+  const recovery = settings.strategy === "fountain"
+    ? `Fountain/LT +${settings.fountainOverhead}%`
+    : settings.fecGroupSize ? `FEC 1/${settings.fecGroupSize}` : "sin FEC";
+  $("qr-settings-label").textContent = `${settings.chunkBytes} bytes · legibilidad ${readability} · ${recovery} · corrección ${settings.errorCorrectionLevel}`;
+  $("indexed-settings").hidden = settings.strategy === "fountain";
+  $("fountain-settings").hidden = settings.strategy !== "fountain";
+  $("missing-settings").hidden = settings.strategy === "fountain";
+  $("strategy-description").textContent = settings.strategy === "fountain"
+    ? "Fountain/LT: transmite símbolos originales y reparaciones combinadas; tolera varias pérdidas sin canal de retorno."
+    : "Indexado: muestra faltantes, recupera una pérdida por grupo y permite retransmitir rangos concretos.";
+}
+
+function qrBinaryPayload(packet) {
+  return [{ data: packet, mode: "byte" }];
+}
+
+function packetChecksum(packet) {
+  if (!packet || packet.length < 15) return "";
+  return Array.from(packet.slice(7, 15), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function packetType(packet) {
+  return packet?.[3];
+}
+
+function packetMagic(packet) {
+  return packet?.[0] === 0x54 && packet?.[1] === 0x4e && packet?.[2] === 0x46 ? "fountain" : "indexed";
+}
+
+function parseSenderMetadata(header, packets, strategy) {
+  const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+  const fountain = strategy === "fountain";
+  return {
+    strategy,
+    checksum: packetChecksum(header),
+    dataPackets: view.getUint32(57),
+    chunkBytes: view.getUint16(55),
+    fecGroupSize: fountain ? 0 : header[5],
+    fountainOverhead: fountain ? header[61] : 0,
+    repairPackets: fountain ? view.getUint32(62) : packets.filter((packet) => packetType(packet) === 2).length,
+    parityPackets: packets.filter((packet) => packetType(packet) === 2).length,
+    codec: header[4] === 1 ? "deflate" : "raw",
+  };
+}
+
+function senderDataPacketCount() {
+  return sender.metadata?.dataPackets || 0;
+}
+
+function senderParityPacketCount() {
+  return sender.metadata?.parityPackets || 0;
+}
+
+function holdFramesFor(entry) {
+  const mode = sender.repeatMode;
+  if (mode === "fast") return 1;
+  if (mode === "reliable") return 4;
+  if (sender.recoveryMode) return 4;
+  if (entry?.kind === "header" || entry?.kind === "parity") return 2;
+  return entry?.payload?.length > 1050 ? 3 : 2;
+}
+
+async function checkBackend() {
+  try {
+    const response = await fetch("/api/health");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const health = await response.json();
+    $("backend-status").textContent = `Backend: ${health.service} — transporte ${health.transport}.`;
+  } catch (error) {
+    $("backend-status").textContent = `Backend Python no disponible: ${error.message}`;
+    $("backend-status").classList.add("error");
+  }
+}
+
+function updateSenderProgress() {
+  const totalData = senderDataPacketCount();
+  const queueTotal = sender.queue.length;
+  const current = queueTotal ? sender.index + 1 : 0;
+  const entry = sender.queue[sender.index];
+  $("sender-progress").max = Math.max(queueTotal, 1);
+  $("sender-progress").value = current;
+  $("sender-progress-label").textContent = entry?.kind === "header"
+    ? `Cabecera · envío ${current} de ${queueTotal}`
+    : entry?.kind === "parity"
+      ? `${sender.strategy === "fountain" ? "Fountain reparación" : "FEC reparación"} · envío ${current} de ${queueTotal}`
+    : `Paquete ${entry ? entry.dataIndex + 1 : 0} de ${totalData} · envío ${current} de ${queueTotal}`;
+  const selected = sender.selectedDataIndexes ? sender.selectedDataIndexes.length : totalData;
+  const parity = sender.selectedDataIndexes ? 0 : senderParityPacketCount();
+  const repairLabel = sender.strategy === "fountain" ? "reparaciones Fountain" : "reparación FEC";
+  $("sender-packet-meta").innerHTML = `Datos: ${selected} de ${totalData} · ${repairLabel}: ${parity} · tiempo: <time id="sender-elapsed">${formatElapsed(clockValue(sender.clock))}</time>`;
+  updateSenderMetrics();
+}
+
+function allSenderDataIndexes() {
+  return Array.from({ length: senderDataPacketCount() }, (_, index) => index);
+}
+
+function buildSenderQueue() {
+  const indexes = sender.selectedDataIndexes || allSenderDataIndexes();
+  const header = { kind: "header", payload: sender.packets[0], dataIndex: -1 };
+  if (!sender.packets.length) {
+    sender.queue = [];
+    return;
+  }
+
+  const body = indexes.map((dataIndex) => ({ kind: "data", payload: sender.packets[dataIndex + 1], dataIndex }));
+  if (!sender.selectedDataIndexes && senderParityPacketCount()) {
+    const parityStart = senderDataPacketCount() + 1;
+    for (let index = 0; index < senderParityPacketCount(); index += 1) {
+      body.push({ kind: "parity", payload: sender.packets[parityStart + index], dataIndex: -1 });
+    }
+  }
+  sender.queue = [header];
+  body.forEach((entry, position) => {
+    if (body.length > 1 && position === Math.ceil(body.length / 2)) sender.queue.push(header);
+    sender.queue.push(entry);
+  });
+  sender.queue.push(header);
+  sender.index = 0;
+  sender.packetRendered = false;
+  sender.packetFrames = 0;
+  updateSenderProgress();
+}
+
+function parseMissingRanges(value, total) {
+  const normalized = value.trim();
+  if (!normalized) return [];
+  const result = new Set();
+  for (const token of normalized.split(",").map((part) => part.trim()).filter(Boolean)) {
+    const match = /^(\d+)(?:-(\d+))?$/.exec(token);
+    if (!match) throw new Error(`Rango inválido: ${token}`);
+    const start = Number(match[1]);
+    const end = match[2] === undefined ? start : Number(match[2]);
+    if (start > end || end >= total) throw new Error(`Rango fuera de límites: ${token}`);
+    for (let index = start; index <= end; index += 1) result.add(index);
+  }
+  return [...result].sort((a, b) => a - b);
+}
+
+function applyMissingSelection(value, source = "manual") {
+  if (sender.strategy === "fountain") throw new Error("Fountain/LT no usa rangos faltantes; ajusta el overhead o continúa transmitiendo símbolos.");
+  const total = senderDataPacketCount();
+  if (!sender.packets.length) throw new Error("Selecciona un archivo antes de aplicar faltantes.");
+  const indexes = parseMissingRanges(value, total);
+  if (!indexes.length) {
+    sender.selectedDataIndexes = null;
+    sender.recoveryMode = false;
+    $("sender-missing-ranges").value = "";
+    setStatus($("sender-file"), `${sender.file.name} — emisión configurada para todos los paquetes.`);
+  } else {
+    sender.selectedDataIndexes = indexes;
+    $("sender-missing-ranges").value = value.trim();
+    setStatus($("sender-file"), `${sender.file.name} — retransmisión selectiva de ${indexes.length} paquetes (${source}).`);
+  }
+  buildSenderQueue();
+  updateSenderProgress();
+}
+
+function updateReceiverProgress() {
+  const [received, total] = transferReceiverProgress();
+  $("receiver-progress").max = Math.max(total, 1);
+  $("receiver-progress").value = received;
+  $("receiver-progress-label").textContent = `Paquetes recibidos: ${received} de ${total}`;
+  const info = transferReceiverInfo();
+  if (info.filename) {
+    const size = info.file_size ? `${(info.file_size / 1024).toFixed(1)} KiB` : "tamaño desconocido";
+    const compressed = info.compressed_size ? ` · comprimido ${(info.compressed_size / 1024).toFixed(1)} KiB` : "";
+    const fec = info.fec_group_size ? ` · FEC recuperados ${info.recovered_packets || 0}` : "";
+    const fountain = info.strategy === "fountain-lt"
+      ? ` · Fountain/LT +${info.overhead_percent || 0}% · símbolos ${info.received_symbols || 0} · recuperados ${info.recovered_packets || 0}`
+      : "";
+    $("receiver-file-meta").textContent = `Archivo: ${info.filename} · ${size}${compressed} · ${info.codec || "—"}${fec}${fountain} · checksum ${info.checksum || "—"}`;
+  } else {
+    $("receiver-file-meta").textContent = "Archivo: pendiente de cabecera.";
+  }
+  const missing = transferReceiverMissingRanges();
+  const visibleMissing = missing.length > 600 ? `${missing.slice(0, 600)}…` : missing;
+  $("receiver-missing-label").textContent = visibleMissing ? `Faltantes: ${visibleMissing}` : (total ? "Faltantes: ninguno" : "Faltantes: —");
+  drawReceiverPacketMap(transferReceiverMap());
+  updateReceiverControlQr();
+  updateReceiverMetrics();
+}
+
+function drawReceiverPacketMap(packetMap) {
+  const width = receiverPacketMapCanvas.width;
+  const height = receiverPacketMapCanvas.height;
+  receiverPacketMapContext.clearRect(0, 0, width, height);
+  receiverPacketMapContext.fillStyle = "#080d18";
+  receiverPacketMapContext.fillRect(0, 0, width, height);
+  if (!packetMap.length) return;
+  const columns = Math.min(width, packetMap.length);
+  const slotWidth = width / columns;
+  for (let column = 0; column < columns; column += 1) {
+    const start = Math.floor(column * packetMap.length / columns);
+    const end = Math.max(start + 1, Math.ceil((column + 1) * packetMap.length / columns));
+    const receivedCount = packetMap.slice(start, end).reduce((sum, received) => sum + received, 0);
+    receiverPacketMapContext.fillStyle = receivedCount === 0
+      ? "#d95f59"
+      : receivedCount === end - start ? "#36b37e" : "#e0a458";
+    const x = Math.floor(column * slotWidth);
+    const nextX = Math.max(x + 1, Math.ceil((column + 1) * slotWidth));
+    receiverPacketMapContext.fillRect(x, 0, nextX - x, height);
+  }
+}
+
+function updateReceiverControlQr() {
+  const controlDetails = $("receiver-control-details");
+  if (controlDetails) controlDetails.hidden = receiver.strategy === "fountain";
+  if (!window.QRCode || receiver.controlRendering) return;
+  if (receiver.strategy === "fountain") {
+    receiver.controlPayload = "";
+    receiverControlCanvas.getContext("2d").clearRect(0, 0, receiverControlCanvas.width, receiverControlCanvas.height);
+    $("receiver-control-status").textContent = "Fountain/LT no requiere canal de retorno.";
+    return;
+  }
+  const payload = binary_receiver_control_packet();
+  receiver.controlPayload = payload;
+  if (!payload) {
+    receiverControlCanvas.getContext("2d").clearRect(0, 0, receiverControlCanvas.width, receiverControlCanvas.height);
+    $("receiver-control-status").textContent = "Aún no hay una cabecera recibida.";
+    return;
+  }
+  receiver.controlRendering = true;
+  try {
+    window.QRCode.toCanvas(receiverControlCanvas, payload, {
+      errorCorrectionLevel: "L",
+      margin: 4,
+      width: 320,
+      color: { dark: "#000000", light: "#ffffff" },
+    }, (error) => {
+      receiver.controlRendering = false;
+      if (error) {
+        $("receiver-control-status").textContent = `La solicitud es demasiado grande para un QR: ${error.message}`;
+        return;
+      }
+      const missing = binary_receiver_missing_ranges();
+      const visible = missing.length > 600 ? `${missing.slice(0, 600)}…` : missing;
+      $("receiver-control-status").textContent = visible
+        ? `Solicitud lista: ${visible}`
+        : "No hay paquetes faltantes.";
+    });
+  } catch (error) {
+    receiver.controlRendering = false;
+    $("receiver-control-status").textContent = `La solicitud es demasiado grande para un QR: ${error.message}`;
+  }
+}
+
+function stopSender() {
+  sender.running = false;
+  if (sender.frame) cancelAnimationFrame(sender.frame);
+  sender.frame = null;
+  sender.rendering = false;
+  sender.packetRendered = false;
+  sender.packetFrames = 0;
+  pauseClock(sender.clock, "sender-elapsed");
+  $("start-sender").disabled = !sender.packets.length;
+  $("start-sender").textContent = sender.packets.length ? "Reanudar emisión" : "Iniciar emisión";
+  $("stop-sender").disabled = true;
+  $("reset-sender").disabled = !sender.packets.length;
+  if (sender.packets.length) setStatus($("sender-file"), `${sender.file.name} — emisión en pausa.`);
+}
+
+function resetSender() {
+  sender.prepareToken += 1;
+  stopSender();
+  sender.packets = [];
+  sender.metadata = null;
+  sender.queue = [];
+  sender.file = null;
+  sender.selectedDataIndexes = null;
+  sender.recoveryMode = false;
+  sender.metrics = { frames: 0, packets: 0, bytes: 0 };
+  $("file-input").value = "";
+  $("sender-missing-ranges").value = "";
+  $("start-sender").disabled = true;
+  $("reset-sender").disabled = true;
+  const context = senderCanvas.getContext("2d");
+  context.clearRect(0, 0, senderCanvas.width, senderCanvas.height);
+  setStatus($("sender-file"), "Ningún archivo seleccionado.");
+  updateSenderProgress();
+}
+
+function renderSenderFrame() {
+  if (!sender.running) return;
+  sender.frame = requestAnimationFrame(renderSenderFrame);
+  if (sender.rendering || !sender.queue.length || !window.QRCode) return;
+
+  if (sender.packetRendered) {
+    sender.packetFrames += 1;
+    if (sender.packetFrames < holdFramesFor(sender.queue[sender.index])) return;
+    const renderedEntry = sender.queue[sender.index];
+    sender.packetRendered = false;
+    sender.packetFrames = 0;
+    sender.index = (sender.index + 1) % sender.queue.length;
+    sender.metrics.frames += 1;
+    sender.metrics.packets += 1;
+    sender.metrics.bytes += renderedEntry?.payload?.length || 0;
+    updateSenderProgress();
+  }
+
+  const payload = sender.queue[sender.index].payload;
+  sender.rendering = true;
+  window.QRCode.toCanvas(senderCanvas, qrBinaryPayload(payload), qrOptions(), (error) => {
+    sender.rendering = false;
+    if (error) {
+      stopSender();
+      setStatus($("sender-file"), `No se pudo generar el QR: ${error.message}`, true);
+      return;
+    }
+    sender.packetRendered = true;
+    sender.packetFrames = 0;
+    updateSenderProgress();
+  });
+}
+
+function startSender() {
+  if (!sender.packets.length) return;
+  if (!sender.queue.length) buildSenderQueue();
+  sender.running = true;
+  sender.packetRendered = false;
+  sender.packetFrames = 0;
+  $("start-sender").disabled = true;
+  $("stop-sender").disabled = false;
+  startClock(sender.clock, "sender-elapsed", updateSenderMetrics);
+  $("start-sender").textContent = "Reanudar emisión";
+  setStatus($("sender-file"), `${sender.file.name} — emisión activa, QR repetido para captura móvil.`);
+  renderSenderFrame();
+}
+
+async function loadFile(file) {
+  const prepareToken = ++sender.prepareToken;
+  stopSender();
+  sender.packets = [];
+  sender.metadata = null;
+  sender.queue = [];
+  sender.selectedDataIndexes = null;
+  sender.recoveryMode = false;
+  sender.metrics = { frames: 0, packets: 0, bytes: 0 };
+  sender.file = null;
+  resetClock(sender.clock, "sender-elapsed");
+  $("sender-missing-ranges").value = "";
+  updateSenderProgress();
+
+  if (!file) return;
+  if (file.size > MAX_FILE_BYTES) {
+    setStatus($("sender-file"), "El archivo supera el límite de 1.5 MiB.", true);
+    return;
+  }
+
+  try {
+    const buffer = await file.arrayBuffer();
+    const fallbackBuffer = buffer.slice(0);
+    const settings = qrSettings();
+    setStatus($("sender-file"), `${file.name} — preparando paquetes en segundo plano…`);
+    let packets;
+    try {
+      packets = await preparePacketsInWorker(buffer, file.name, settings);
+    } catch (error) {
+      console.warn("Worker de paquetes no disponible; usando fallback síncrono.", error);
+      const prepare = settings.strategy === "fountain" ? prepare_fountain_packets : prepare_binary_packets;
+      const option = settings.strategy === "fountain" ? settings.fountainOverhead : settings.fecGroupSize;
+      packets = Array.from(prepare(
+        new Uint8Array(fallbackBuffer), file.name, settings.chunkBytes, option,
+      ), (packet) => new Uint8Array(packet));
+    }
+    if (prepareToken !== sender.prepareToken) return;
+    sender.packets = packets;
+    if (!sender.packets.length) throw new Error("WASM rechazó el archivo o el nombre es demasiado largo.");
+    sender.file = file;
+    const header = sender.packets[0];
+    sender.strategy = settings.strategy;
+    sender.metadata = parseSenderMetadata(header, sender.packets, settings.strategy);
+    buildSenderQueue();
+    $("start-sender").disabled = false;
+    $("reset-sender").disabled = false;
+    setStatus($("sender-file"), `${file.name} — ${(file.size / 1024).toFixed(1)} KiB listo con ${sender.metadata.dataPackets} paquetes binarios de ${settings.chunkBytes} bytes (${sender.metadata.codec}).`);
+    updateSenderProgress();
+  } catch (error) {
+    setStatus($("sender-file"), `No se pudo preparar el archivo: ${error.message}`, true);
+  }
+}
+
+function handleReceiverRequest(payload) {
+  const fields = payload.split("|");
+  if (fields.length !== 3 || fields[0] !== "REQUEST") return false;
+  if (!sender.packets.length) {
+    setStatus($("sender-file"), "Solicitud recibida; selecciona primero el archivo original.", true);
+    return true;
+  }
+  if (fields[1] !== sender.metadata?.checksum) {
+    setStatus($("sender-file"), "La solicitud pertenece a otro archivo.", true);
+    return true;
+  }
+  if (sender.strategy === "fountain") {
+    setStatus($("sender-file"), "Fountain/LT no usa solicitudes NACK; continúa emitiendo símbolos y reparaciones.");
+    return true;
+  }
+  try {
+    sender.recoveryMode = Boolean(fields[2]);
+    applyMissingSelection(fields[2], "QR del receptor");
+    setStatus($("sender-file"), `${sender.file.name} — solicitud de faltantes aplicada; inicia o continúa la emisión.`);
+    return true;
+  } catch (error) {
+    setStatus($("sender-file"), `Solicitud de faltantes inválida: ${error.message}`, true);
+    return true;
+  }
+}
+
+function stopSenderControl() {
+  senderControl.running = false;
+  if (senderControl.frame) cancelAnimationFrame(senderControl.frame);
+  senderControl.frame = null;
+  if (senderControl.stream) senderControl.stream.getTracks().forEach((track) => track.stop());
+  senderControl.stream = null;
+  $("sender-control-video").srcObject = null;
+  $("sender-control-video").hidden = true;
+  $("start-sender-control").disabled = false;
+  $("stop-sender-control").disabled = true;
+}
+
+function scanSenderControlFrame() {
+  if (!senderControl.running) return;
+  senderControl.frame = requestAnimationFrame(scanSenderControlFrame);
+  const video = $("sender-control-video");
+  if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth) return;
+  const width = Math.min(800, video.videoWidth);
+  const height = Math.round(video.videoHeight * (width / video.videoWidth));
+  if (senderControlScanCanvas.width !== width || senderControlScanCanvas.height !== height) {
+    senderControlScanCanvas.width = width;
+    senderControlScanCanvas.height = height;
+  }
+  senderControlScanContext.imageSmoothingEnabled = false;
+  senderControlScanContext.drawImage(video, 0, 0, width, height);
+  const image = senderControlScanContext.getImageData(0, 0, width, height);
+  let code;
+  try {
+    code = window.jsQR(image.data, image.width, image.height, { inversionAttempts: "attemptBoth" });
+  } catch (error) {
+    receiverLog("jsQR lanzó una excepción en el lector de solicitudes", { message: error.message });
+    return;
+  }
+  if (!code?.data || code.data === senderControl.lastRequest) return;
+  if (code.data.startsWith("REQUEST|")) {
+    senderControl.lastRequest = code.data;
+    receiverLog("Solicitud óptica recibida por el emisor", { length: code.data.length });
+    handleReceiverRequest(code.data);
+  }
+}
+
+async function startSenderControl() {
+  if (!window.isSecureContext && !["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname)) {
+    setStatus($("sender-file"), "La webcam requiere HTTPS. Abre https://IP_DE_LA_PC:30000 y acepta el certificado.", true);
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    setStatus($("sender-file"), "Este navegador no expone getUserMedia para leer faltantes.", true);
+    return;
+  }
+  try {
+    senderControl.lastRequest = "";
+    try {
+      senderControl.stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 800 }, height: { ideal: 600 } },
+      });
+    } catch (error) {
+      if (!["OverconstrainedError", "NotFoundError", "NotReadableError"].includes(error.name)) throw error;
+      receiverLog("Configuración preferida rechazada en lector de solicitudes; probando webcam genérica", {
+        name: error.name,
+        message: error.message,
+      });
+      senderControl.stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+    }
+    const video = $("sender-control-video");
+    video.hidden = false;
+    video.srcObject = senderControl.stream;
+    await video.play();
+    senderControl.running = true;
+    $("start-sender-control").disabled = true;
+    $("stop-sender-control").disabled = false;
+    setStatus($("sender-file"), "Lector activo: apunta la cámara del emisor al QR de solicitud del receptor.");
+    scanSenderControlFrame();
+  } catch (error) {
+    stopSenderControl();
+    setStatus($("sender-file"), `No se pudo activar el lector de solicitudes: ${describeCameraError(error)}`, true);
+  }
+}
+
+function stopReceiver() {
+  receiver.running = false;
+  const video = $("receiver-video");
+  if (receiver.frame && receiver.frameKind === "video" && video.cancelVideoFrameCallback) {
+    video.cancelVideoFrameCallback(receiver.frame);
+  } else if (receiver.frame) {
+    cancelAnimationFrame(receiver.frame);
+  }
+  receiver.frame = null;
+  receiver.frameKind = null;
+  if (receiver.stream) receiver.stream.getTracks().forEach((track) => track.stop());
+  receiver.stream = null;
+  $("receiver-video").srcObject = null;
+  pauseClock(receiver.clock, "receiver-elapsed");
+  $("start-receiver").disabled = false;
+  $("stop-receiver").disabled = true;
+  receiverLog("Cámara detenida");
+}
+
+function receiverCameraConstraints() {
+  const deviceId = $("receiver-camera-select")?.value;
+  const video = {
+    width: { ideal: 1280 },
+    height: { ideal: 720 },
+    frameRate: { ideal: 30, max: 60 },
+  };
+  if (deviceId) video.deviceId = { exact: deviceId };
+  else video.facingMode = { ideal: "environment" };
+  return { audio: false, video };
+}
+
+async function refreshReceiverCameras() {
+  if (!navigator.mediaDevices?.enumerateDevices) return;
+  const select = $("receiver-camera-select");
+  if (!select) return;
+  const selected = select.value;
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cameras = devices.filter((device) => device.kind === "videoinput");
+  select.replaceChildren(new Option("Seleccionar automáticamente", ""));
+  cameras.forEach((camera, index) => {
+    const label = camera.label || `Webcam ${index + 1}`;
+    select.append(new Option(label, camera.deviceId));
+  });
+  if (cameras.some((camera) => camera.deviceId === selected)) select.value = selected;
+  receiverLog("Webcams disponibles", { count: cameras.length, labels: cameras.map((camera) => camera.label || "sin etiqueta") });
+}
+
+async function openReceiverCamera() {
+  const preferred = receiverCameraConstraints();
+  try {
+    return await navigator.mediaDevices.getUserMedia(preferred);
+  } catch (error) {
+    const recoverable = ["OverconstrainedError", "NotFoundError", "NotReadableError"].includes(error.name);
+    if (!recoverable) throw error;
+    receiverLog("Configuración preferida rechazada; probando webcam genérica", {
+      name: error.name,
+      message: error.message,
+    });
+    return navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+  }
+}
+
+async function waitForVideoMetadata(video) {
+  if (video.readyState >= HTMLMediaElement.HAVE_METADATA && video.videoWidth > 0) return;
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("La webcam no entregó dimensiones de vídeo")), 5000);
+    video.addEventListener("loadedmetadata", () => {
+      clearTimeout(timeout);
+      resolve();
+    }, { once: true });
+  });
+}
+
+function describeCameraError(error) {
+  const reasons = {
+    NotAllowedError: "permiso denegado; habilita la webcam para este sitio",
+    NotFoundError: "no se encontró ninguna webcam disponible",
+    NotReadableError: "la webcam está siendo usada por otra aplicación o el sistema la bloqueó",
+    OverconstrainedError: "la webcam no admite la configuración solicitada",
+    SecurityError: "el navegador bloqueó la cámara por seguridad; usa HTTPS",
+  };
+  return reasons[error?.name]
+    ? `${reasons[error.name]} (${error.name})`
+    : `${error?.message || error} (${error?.name || "Error"})`;
+}
+
+function finishDownload(bytes) {
+  const info = transferReceiverInfo();
+  const filename = info.filename || binary_receiver_filename() || "archivo-recibido.bin";
+  pauseClock(receiver.clock, "receiver-elapsed");
+  const blob = new Blob([bytes], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const link = $("download-link");
+  link.href = url;
+  link.download = filename;
+  link.hidden = false;
+  link.textContent = `Descargar ${filename}`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  clearReceiverSessionStore();
+  setStatus($("receiver-status"), `Transferencia completa: ${filename}.`);
+  updateReceiverProgress();
+}
+
+function scheduleReceiverFrame() {
+  if (!receiver.running) return;
+  const video = $("receiver-video");
+  if (video.requestVideoFrameCallback) {
+    receiver.frameKind = "video";
+    receiver.frame = video.requestVideoFrameCallback(() => scanReceiverFrame());
+  } else {
+    receiver.frameKind = "raf";
+    receiver.frame = requestAnimationFrame(scanReceiverFrame);
+  }
+}
+
+function updateReceiverRoi(code, crop) {
+  const points = [
+    code.location?.topLeftCorner,
+    code.location?.topRightCorner,
+    code.location?.bottomRightCorner,
+    code.location?.bottomLeftCorner,
+  ].filter(Boolean);
+  if (points.length !== 4) return;
+  const minX = Math.min(...points.map((point) => point.x));
+  const maxX = Math.max(...points.map((point) => point.x));
+  const minY = Math.min(...points.map((point) => point.y));
+  const maxY = Math.max(...points.map((point) => point.y));
+  const marginX = Math.max(18, (maxX - minX) * 0.12);
+  const marginY = Math.max(18, (maxY - minY) * 0.12);
+  const x = Math.max(0, minX - marginX);
+  const y = Math.max(0, minY - marginY);
+  const right = Math.min(crop.scanWidth, maxX + marginX);
+  const bottom = Math.min(crop.scanHeight, maxY + marginY);
+  receiver.roi = {
+    x: crop.x + x / crop.scanWidth * crop.width,
+    y: crop.y + y / crop.scanHeight * crop.height,
+    width: (right - x) / crop.scanWidth * crop.width,
+    height: (bottom - y) / crop.scanHeight * crop.height,
+  };
+  receiver.roiMisses = 0;
+}
+
+function qrFingerprint(code) {
+  if (code.data?.startsWith("REQUEST|")) return code.data;
+  const bytes = code.binaryData || [];
+  return `binary:${bytes.length}:${Array.from(bytes.slice(0, 18)).join(",")}`;
+}
+
+function scanReceiverFrame() {
+  if (!receiver.running) return;
+  scheduleReceiverFrame();
+  receiver.stats.frames += 1;
+  const video = $("receiver-video");
+  if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth) {
+    if (receiver.stats.frames % 60 === 0) receiverLog("Esperando frame de vídeo", {
+      readyState: video.readyState,
+      videoWidth: video.videoWidth,
+      videoHeight: video.videoHeight,
+    });
+    return;
+  }
+
+  const activeRoi = receiver.roi || { x: 0, y: 0, width: 1, height: 1 };
+  const crop = {
+    x: Math.max(0, Math.min(1, activeRoi.x)),
+    y: Math.max(0, Math.min(1, activeRoi.y)),
+    width: Math.max(0.1, Math.min(1, activeRoi.width)),
+    height: Math.max(0.1, Math.min(1, activeRoi.height)),
+  };
+  const cropWidth = Math.round(video.videoWidth * crop.width);
+  const cropHeight = Math.round(video.videoHeight * crop.height);
+  const scale = Math.min(1, MAX_SCAN_WIDTH / cropWidth);
+  const width = Math.max(640, Math.round(cropWidth * scale));
+  const height = Math.max(480, Math.round(cropHeight * (width / cropWidth)));
+  if (scanCanvas.width !== width || scanCanvas.height !== height) {
+    scanCanvas.width = width;
+    scanCanvas.height = height;
+  }
+  scanContext.imageSmoothingEnabled = false;
+  scanContext.drawImage(
+    video,
+    Math.round(video.videoWidth * crop.x),
+    Math.round(video.videoHeight * crop.y),
+    cropWidth,
+    cropHeight,
+    0,
+    0,
+    width,
+    height,
+  );
+  const image = scanContext.getImageData(0, 0, width, height);
+  let code;
+  try {
+    code = window.jsQR(image.data, image.width, image.height, { inversionAttempts: "attemptBoth" });
+  } catch (error) {
+    receiverLog("jsQR lanzó una excepción", { message: error.message });
+    return;
+  }
+  if (!code?.binaryData?.length) {
+    receiver.roiMisses += 1;
+    if (receiver.roiMisses >= 10) receiver.roi = null;
+    if (receiver.stats.frames % 60 === 0) receiverLog("Sin QR detectado", {
+      frames: receiver.stats.frames,
+      video: `${video.videoWidth}x${video.videoHeight}`,
+      scan: `${width}x${height}`,
+      roi: receiver.roi ? "activa" : "completa",
+    });
+    return;
+  }
+
+  receiver.stats.qrDetections += 1;
+  updateReceiverRoi(code, {
+    ...crop,
+    scanWidth: width,
+    scanHeight: height,
+  });
+  const fingerprint = qrFingerprint(code);
+  if (fingerprint === receiver.lastPacket) {
+    receiver.stats.duplicates += 1;
+    return;
+  }
+
+  receiver.lastPacket = fingerprint;
+  receiverLog("QR detectado", {
+    length: code.binaryData.length,
+    type: code.data?.startsWith("REQUEST|") ? "control" : "binario",
+    detections: receiver.stats.qrDetections,
+  });
+  try {
+    const packet = new Uint8Array(code.binaryData);
+    const assembled = processTransferPacket(packet);
+    persistReceiverPacket(packet);
+    receiver.stats.packets += 1;
+    updateReceiverProgress();
+    receiverLog("Paquete enviado a WASM", {
+      packets: receiver.stats.packets,
+      progress: $("receiver-progress-label").textContent,
+    });
+    if (assembled !== null && assembled !== undefined) finishDownload(assembled);
+  } catch (error) {
+    receiverLog("WASM rechazó el paquete", { message: error.message });
+    setStatus($("receiver-status"), `Paquete inválido: ${error.message}`, true);
+  }
+}
+
+async function resetReceiverSession() {
+  stopReceiver();
+  reset_binary_receiver();
+  reset_fountain_receiver();
+  receiver.strategy = "indexed";
+  receiver.lastPacket = "";
+  receiver.roi = null;
+  receiver.roiMisses = 0;
+  receiver.logLines = [];
+  receiver.stats = { frames: 0, qrDetections: 0, duplicates: 0, packets: 0 };
+  receiver.persistenceError = false;
+  resetClock(receiver.clock, "receiver-elapsed");
+  await clearReceiverSessionStore();
+  $("download-link").hidden = true;
+  $("receiver-status").textContent = "Recepción reiniciada.";
+  updateReceiverProgress();
+}
+
+async function startReceiver() {
+  receiver.logLines = [];
+  receiver.stats = { frames: 0, qrDetections: 0, duplicates: 0, packets: 0 };
+  receiverLog("Entorno de cámara", {
+    secureContext: window.isSecureContext,
+    protocol: window.location.protocol,
+    host: window.location.host,
+    userAgent: navigator.userAgent,
+  });
+  if (!window.isSecureContext && !["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname)) {
+    setStatus($("receiver-status"), "La webcam requiere HTTPS. Abre https://IP_DE_LA_PC:30000 y acepta el certificado.", true);
+    receiverLog("Contexto inseguro: getUserMedia bloqueado por el navegador");
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    setStatus($("receiver-status"), "Este navegador no expone getUserMedia.", true);
+    return;
+  }
+  if (!window.jsQR) {
+    setStatus($("receiver-status"), "No se pudo cargar el decodificador jsQR.", true);
+    return;
+  }
+  try {
+    receiver.roi = null;
+    receiver.roiMisses = 0;
+    receiver.frameKind = null;
+    resetClock(receiver.clock, "receiver-elapsed");
+    receiverLog("Solicitando cámara");
+    reset_binary_receiver();
+    reset_fountain_receiver();
+    receiver.strategy = "indexed";
+    receiver.lastPacket = "";
+    updateReceiverProgress();
+    const restored = await restoreReceiverSession();
+    updateReceiverProgress();
+    if (restored) {
+      finishDownload(restored);
+      return;
+    }
+    receiver.stream = await openReceiverCamera();
+    const video = $("receiver-video");
+    video.srcObject = receiver.stream;
+    await video.play();
+    await waitForVideoMetadata(video);
+    try {
+      await refreshReceiverCameras();
+    } catch (error) {
+      receiverLog("No se pudo enumerar webcams; se conserva la cámara activa", { message: error.message });
+    }
+    const track = receiver.stream.getVideoTracks()[0];
+    const settings = track?.getSettings?.() || {};
+    const capabilities = track?.getCapabilities?.() || {};
+    receiverLog("Cámara activa", {
+      label: track?.label || "desconocida",
+      settings,
+      focusModes: capabilities.focusMode || [],
+    });
+    if (capabilities.focusMode?.includes("continuous")) {
+      try {
+        await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+        receiverLog("Enfoque continuo solicitado");
+      } catch (error) {
+        receiverLog("No se pudo aplicar enfoque continuo", { message: error.message });
+      }
+    }
+    receiver.running = true;
+    startClock(receiver.clock, "receiver-elapsed", updateReceiverMetrics);
+    $("start-receiver").disabled = true;
+    $("stop-receiver").disabled = false;
+    setStatus($("receiver-status"), "Cámara activa. Buscando paquetes…");
+    receiver.scanWithVideoFrameCallback = Boolean(video.requestVideoFrameCallback);
+    receiverLog("Escaneo sincronizado con frames de vídeo", { requestVideoFrameCallback: receiver.scanWithVideoFrameCallback });
+    scheduleReceiverFrame();
+  } catch (error) {
+    stopReceiver();
+    receiverLog("Error de cámara", { name: error.name, message: error.message });
+    setStatus($("receiver-status"), `No se pudo activar la cámara: ${describeCameraError(error)}`, true);
+  }
+}
+
+function switchTab(tab) {
+  document.querySelectorAll(".tab").forEach((button) => {
+    button.setAttribute("aria-selected", String(button.dataset.tab === tab));
+  });
+  document.querySelectorAll(".panel").forEach((panel) => panel.classList.toggle("active", panel.id === `${tab}-panel`));
+}
+
+$("file-input").addEventListener("change", (event) => loadFile(event.target.files[0]));
+$("drop-zone").addEventListener("dragover", (event) => { event.preventDefault(); $("drop-zone").classList.add("dragover"); });
+$("drop-zone").addEventListener("dragleave", () => $("drop-zone").classList.remove("dragover"));
+$("drop-zone").addEventListener("drop", (event) => {
+  event.preventDefault();
+  $("drop-zone").classList.remove("dragover");
+  loadFile(event.dataTransfer.files[0]);
+});
+$("start-sender").addEventListener("click", startSender);
+$("stop-sender").addEventListener("click", stopSender);
+$("reset-sender").addEventListener("click", resetSender);
+$("apply-missing").addEventListener("click", () => {
+  try {
+    applyMissingSelection($("sender-missing-ranges").value);
+  } catch (error) {
+    setStatus($("sender-file"), error.message, true);
+  }
+});
+$("clear-missing").addEventListener("click", () => {
+  try {
+    applyMissingSelection("");
+  } catch (error) {
+    setStatus($("sender-file"), error.message, true);
+  }
+});
+$("start-sender-control").addEventListener("click", startSenderControl);
+$("stop-sender-control").addEventListener("click", stopSenderControl);
+$("start-receiver").addEventListener("click", startReceiver);
+$("stop-receiver").addEventListener("click", stopReceiver);
+$("reset-receiver").addEventListener("click", () => { resetReceiverSession(); });
+document.querySelectorAll(".tab").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tab)));
+$("qr-chunk-size").addEventListener("input", updateQrSettingsLabel);
+$("qr-chunk-size").addEventListener("change", () => {
+  if (sender.file) loadFile(sender.file);
+});
+$("qr-error-correction").addEventListener("change", () => {
+  updateQrSettingsLabel();
+  if (sender.file) loadFile(sender.file);
+});
+$("qr-fec-group").addEventListener("change", () => {
+  updateQrSettingsLabel();
+  if (sender.file) loadFile(sender.file);
+});
+$("transfer-strategy").addEventListener("change", () => {
+  updateQrSettingsLabel();
+  if (sender.file) loadFile(sender.file);
+});
+$("fountain-overhead").addEventListener("change", () => {
+  updateQrSettingsLabel();
+  if (sender.file) loadFile(sender.file);
+});
+$("qr-repeat-mode").addEventListener("change", () => {
+  sender.repeatMode = $("qr-repeat-mode").value;
+  updateQrSettingsLabel();
+});
+updateQrSettingsLabel();
+window.addEventListener("beforeunload", () => {
+  stopSender();
+  stopSenderControl();
+  stopReceiver();
+  packetWorker?.terminate();
+});
+
+try {
+  await init();
+  updateReceiverProgress();
+  setStatus($("sender-file"), "WASM listo. Selecciona un archivo.");
+  checkBackend();
+} catch (error) {
+  setStatus($("sender-file"), `No se pudo cargar WASM: ${error.message}`, true);
+  $("start-receiver").disabled = true;
+}

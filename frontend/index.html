@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#101827" />
+    <title>Tōna Transfer</title>
+    <style>
+      :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; background: radial-gradient(circle at top, #172743 0, #0b1020 42rem); color: #edf2f7; }
+      main { width: min(1120px, 100%); margin: 0 auto; padding: max(20px, env(safe-area-inset-top)) 16px max(48px, env(safe-area-inset-bottom)); }
+      .app-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+      .brand-mark { display: inline-flex; align-items: center; gap: 8px; color: #8de6bd; font-size: .78rem; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+      .brand-mark::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: #36b37e; box-shadow: 0 0 14px #36b37e; }
+      .environment-pill { margin: 4px 0 0; padding: 7px 10px; border: 1px solid #2c466c; border-radius: 999px; color: #a7b4c9; font-size: .75rem; white-space: nowrap; }
+      h1 { margin: 0 0 8px; font-size: clamp(1.5rem, 4vw, 2.25rem); }
+      h2 { margin-top: 0; }
+      .subtitle, .hint { color: #a7b4c9; }
+      .tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin: 24px 0 16px; padding: 5px; border: 1px solid #26344e; border-radius: 14px; background: #0c1425; }
+      .tabs button { min-height: 44px; }
+      button, .file-label { border: 0; border-radius: 10px; padding: 11px 16px; background: #2d6cdf; color: white; font: inherit; cursor: pointer; }
+      button.secondary, .file-label { background: #26344e; }
+      button:disabled { cursor: not-allowed; opacity: .5; }
+      .tab[aria-selected="true"] { background: #36b37e; }
+      .panel { display: none; padding: clamp(16px, 3vw, 28px); border: 1px solid #26344e; border-radius: 20px; background: rgba(17, 26, 45, .94); box-shadow: 0 20px 60px rgba(0, 0, 0, .18); }
+      .panel.active { display: block; }
+      .panel-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+      .panel-header h2 { margin-bottom: 5px; }
+      .eyebrow { margin: 0; color: #8de6bd; font-size: .75rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+      .transfer-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: clamp(18px, 3vw, 32px); align-items: start; }
+      .surface { padding: 14px; border: 1px solid #26344e; border-radius: 14px; background: #0f192c; }
+      .drop-zone { border: 2px dashed #50678f; border-radius: 14px; padding: 34px 18px; text-align: center; transition: border-color .2s, background .2s; }
+      .drop-zone.dragover { border-color: #36b37e; background: #172b38; }
+      .actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0; }
+      .actions button { min-height: 44px; }
+      .qr-settings { display: grid; gap: 10px; margin: 16px 0; padding: 14px; border: 1px solid #26344e; border-radius: 14px; background: #0f192c; }
+      .qr-settings label { display: flex; justify-content: space-between; gap: 12px; color: #c9d5e8; }
+      .qr-settings input[type="range"] { width: 100%; accent-color: #36b37e; }
+      .qr-settings select, .missing-input { border: 1px solid #50678f; border-radius: 8px; padding: 8px 10px; background: #0b1020; color: #edf2f7; font: inherit; }
+      .missing-settings { display: grid; gap: 8px; margin: 16px 0; padding: 12px; border: 1px solid #26344e; border-radius: 10px; }
+      .missing-settings label { color: #c9d5e8; }
+      .missing-row { display: flex; flex-wrap: wrap; gap: 8px; }
+      .missing-row .missing-input { flex: 1 1 240px; min-width: 0; }
+      .status { min-height: 1.5em; color: #b8c5d9; }
+      .error { color: #ff9b9b; }
+      .progress-wrap { margin: 16px 0; }
+      progress { width: 100%; height: 12px; accent-color: #36b37e; }
+      #sender-canvas { display: block; width: min(80vw, 640px); height: min(80vw, 640px); margin: 18px auto 4px; background: white; image-rendering: pixelated; }
+      #receiver-video { display: block; width: min(100%, 560px); max-height: 55vh; margin: 16px auto; border-radius: 12px; background: #05070c; object-fit: cover; }
+      #receiver-camera-select { display: block; width: 100%; margin-top: 6px; border: 1px solid #50678f; border-radius: 8px; padding: 8px 10px; background: #0b1020; color: #edf2f7; font: inherit; }
+      #sender-control-video { display: block; width: min(100%, 360px); max-height: 28vh; margin: 12px auto; border-radius: 10px; background: #05070c; object-fit: cover; }
+      .packet-map { display: block; width: 100%; height: 52px; margin: 8px 0; border: 1px solid #26344e; border-radius: 8px; background: #080d18; image-rendering: pixelated; }
+      #receiver-control-canvas { display: block; width: min(70vw, 320px); height: min(70vw, 320px); margin: 12px auto; background: white; image-rendering: pixelated; }
+      .meta { color: #c9d5e8; margin: 8px 0; }
+      time { font-variant-numeric: tabular-nums; color: #bfe3ff; }
+      .diagnostics { margin-top: 16px; color: #a7b4c9; }
+      .diagnostics summary { cursor: pointer; }
+      .diagnostics pre { max-height: 180px; overflow: auto; padding: 10px; border-radius: 8px; background: #080d18; color: #bfe3ff; font: .75rem ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+      .small { font-size: .9rem; }
+      .settings-title { margin: 0 0 2px; color: #edf2f7; font-weight: 700; }
+      .settings-group { display: grid; gap: 10px; }
+      .metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+      .metric { margin: 0; padding: 10px 12px; border-radius: 10px; background: #0b1221; color: #b8c5d9; font-size: .85rem; }
+      .metric strong { display: block; margin-top: 3px; color: #edf2f7; font-size: 1rem; }
+      .camera-stage { overflow: hidden; border-radius: 14px; background: #05070c; }
+      #receiver-video { margin: 0; width: 100%; aspect-ratio: 4 / 3; max-height: 62vh; }
+      #sender-canvas { width: min(100%, 640px); height: auto; margin: 0 auto; }
+      .progress-wrap { padding: 12px 0 0; }
+      button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-visible { outline: 3px solid rgba(141, 230, 189, .7); outline-offset: 2px; }
+      @media (min-width: 1000px) {
+        .transfer-grid { grid-template-columns: minmax(0, .9fr) minmax(420px, 1.1fr); }
+      }
+      @media (max-width: 760px) {
+        main { padding-left: 12px; padding-right: 12px; }
+        .app-header { display: block; }
+        .environment-pill { display: inline-block; margin-top: 12px; }
+        .transfer-grid { grid-template-columns: 1fr; }
+        .panel-header { display: block; }
+        .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .actions button { width: 100%; padding-left: 10px; padding-right: 10px; }
+        .actions button:first-child:last-child { grid-column: 1 / -1; }
+        .qr-settings label, .missing-settings label { display: grid; gap: 5px; }
+        .qr-settings label output { font-size: .85rem; }
+        .missing-row { display: grid; grid-template-columns: 1fr 1fr; }
+        .missing-row .missing-input { grid-column: 1 / -1; }
+        .missing-row button { min-width: 0; }
+        #receiver-control-canvas { width: min(78vw, 320px); height: auto; }
+      }
+      @media (max-width: 420px) {
+        h1 { font-size: 1.55rem; }
+        .panel { padding: 14px; border-radius: 16px; }
+        .actions { grid-template-columns: 1fr; }
+        .actions button { grid-column: 1; }
+        .metric-grid { grid-template-columns: 1fr; }
+        .drop-zone { padding: 24px 12px; }
+      }
+      code { color: #bfe3ff; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header class="app-header">
+        <div>
+          <p class="brand-mark">Transferencia óptica</p>
+          <h1>Tōna Transfer</h1>
+          <p class="subtitle">Transfiere archivos binarios usando la luz de la pantalla, sin Wi‑Fi, Bluetooth ni Internet.</p>
+        </div>
+        <p id="backend-status" class="environment-pill">Comprobando backend Python…</p>
+      </header>
+
+      <nav class="tabs" aria-label="Modo de transferencia">
+        <button class="tab" data-tab="sender" aria-selected="true">Emisor</button>
+        <button class="tab secondary" data-tab="receiver" aria-selected="false">Receptor</button>
+      </nav>
+
+      <section id="sender-panel" class="panel active" aria-labelledby="sender-tab">
+        <div class="panel-header"><div><p class="eyebrow">Modo 01</p><h2>Emisor</h2><p class="hint small">Prepara un archivo y deja el QR visible con el brillo alto.</p></div></div>
+        <div class="transfer-grid">
+          <div>
+            <div id="drop-zone" class="drop-zone">
+              <p>Arrastra un archivo aquí o selecciónalo.</p>
+              <label class="file-label" for="file-input">Seleccionar archivo</label>
+              <input id="file-input" type="file" hidden />
+              <p class="hint small">Límite de transferencia: 1.5 MiB.</p>
+            </div>
+            <div class="actions">
+              <button id="start-sender" disabled>Iniciar emisión</button>
+              <button id="stop-sender" class="secondary" disabled>Pausar</button>
+              <button id="reset-sender" class="secondary" disabled>Limpiar emisor</button>
+            </div>
+            <div class="qr-settings">
+              <p class="settings-title">Estrategia de transporte</p>
+              <label for="transfer-strategy"><span>Implementación</span>
+                <select id="transfer-strategy">
+                  <option value="indexed" selected>Indexado + XOR/NACK</option>
+                  <option value="fountain">Fountain/LT — sin canal de retorno</option>
+                </select>
+              </label>
+              <p id="strategy-description" class="hint small">Indexado: muestra faltantes, recupera una pérdida por grupo y permite retransmitir rangos concretos.</p>
+            </div>
+            <div class="qr-settings">
+              <p class="settings-title">Ajustes de lectura</p>
+              <label for="qr-chunk-size"><span>Densidad del QR</span><output id="qr-settings-label">600 bytes por paquete</output></label>
+              <input id="qr-chunk-size" type="range" min="400" max="1800" step="100" value="600" />
+              <label for="qr-error-correction"><span>Corrección de errores</span>
+                <select id="qr-error-correction">
+                  <option value="L" selected>L — más capacidad</option>
+                  <option value="M">M — más tolerancia</option>
+                </select>
+              </label>
+              <div id="indexed-settings" class="settings-group">
+                <label for="qr-fec-group"><span>Recuperación FEC</span>
+                  <select id="qr-fec-group">
+                    <option value="8" selected>1 reparación cada 8 paquetes</option>
+                    <option value="0">Desactivada — menor tráfico</option>
+                  </select>
+                </label>
+              </div>
+              <label id="fountain-settings" for="fountain-overhead" hidden><span>Overhead Fountain/LT</span>
+                <select id="fountain-overhead">
+                  <option value="10">10% — rápido</option>
+                  <option value="20">20% — equilibrado</option>
+                  <option value="30" selected>30% — tolerante</option>
+                  <option value="40">40% — máxima recuperación</option>
+                </select>
+              </label>
+              <label for="qr-repeat-mode"><span>Repetición</span>
+                <select id="qr-repeat-mode">
+                  <option value="auto" selected>Automática</option>
+                  <option value="fast">Rápida</option>
+                  <option value="reliable">Confiable</option>
+                </select>
+              </label>
+              <p class="hint small">La densidad, corrección y estrategia se aplican desde el navegador; no requieren recompilar WASM.</p>
+            </div>
+          </div>
+          <div>
+        <div id="missing-settings" class="missing-settings">
+          <label for="sender-missing-ranges">Retransmitir sólo paquetes faltantes</label>
+          <div class="missing-row">
+            <input id="sender-missing-ranges" class="missing-input" type="text" placeholder="Ej.: 0-3,8,10-12" autocomplete="off" />
+            <button id="apply-missing" class="secondary" type="button">Aplicar faltantes</button>
+            <button id="clear-missing" class="secondary" type="button">Enviar todos</button>
+          </div>
+          <p class="hint small">Los índices son los paquetes de datos, empezando en 0. También puedes activar la cámara para leer la solicitud QR del receptor.</p>
+          <div class="actions">
+            <button id="start-sender-control" class="secondary" type="button">Leer solicitud del receptor</button>
+            <button id="stop-sender-control" class="secondary" type="button" disabled>Detener lector</button>
+          </div>
+          <video id="sender-control-video" autoplay playsinline muted hidden></video>
+          <canvas id="sender-control-scan-canvas" hidden></canvas>
+        </div>
+        <p id="sender-file" class="status">Ningún archivo seleccionado.</p>
+        <p id="sender-packet-meta" class="meta small">Paquetes: 0 · tiempo: <time id="sender-elapsed">00:00</time></p>
+        <p id="sender-metrics" class="meta small">Rendimiento: —</p>
+        <div class="progress-wrap">
+          <progress id="sender-progress" value="0" max="1"></progress>
+          <p id="sender-progress-label" class="small">Paquete 0 de 0</p>
+        </div>
+        <canvas id="sender-canvas" width="640" height="640" aria-label="Código QR emitido"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <section id="receiver-panel" class="panel" aria-labelledby="receiver-tab">
+        <div class="panel-header"><div><p class="eyebrow">Modo 02</p><h2>Receptor</h2><p class="hint small">Acepta el certificado autofirmado y apunta la cámara al QR del emisor.</p></div></div>
+        <label for="receiver-camera-select" class="meta small">Webcam
+          <select id="receiver-camera-select" aria-label="Seleccionar webcam">
+            <option value="">Seleccionar automáticamente</option>
+          </select>
+        </label>
+        <div class="actions">
+          <button id="start-receiver">Activar cámara</button>
+          <button id="stop-receiver" class="secondary" disabled>Detener cámara</button>
+          <button id="reset-receiver" class="secondary">Reiniciar recepción</button>
+        </div>
+        <div class="camera-stage"><video id="receiver-video" autoplay playsinline muted></video></div>
+        <canvas id="scan-canvas" hidden></canvas>
+        <p id="receiver-status" class="status">Cámara inactiva.</p>
+        <p id="receiver-file-meta" class="meta small">Archivo: pendiente de cabecera.</p>
+        <div class="progress-wrap">
+          <progress id="receiver-progress" value="0" max="1"></progress>
+          <p id="receiver-progress-label" class="small">Paquetes recibidos: 0 de 0</p>
+        </div>
+        <p id="receiver-missing-label" class="meta small">Faltantes: —</p>
+        <canvas id="receiver-packet-map" class="packet-map" width="720" height="52" aria-label="Mapa de paquetes recibidos y faltantes"></canvas>
+        <details id="receiver-control-details" class="missing-settings">
+          <summary>Solicitud óptica de retransmisión</summary>
+          <p class="hint small">Apunta la cámara del emisor a este QR para que envíe sólo los paquetes faltantes.</p>
+          <canvas id="receiver-control-canvas" width="320" height="320" aria-label="Solicitud QR de paquetes faltantes"></canvas>
+          <p id="receiver-control-status" class="status small">Aún no hay una cabecera recibida.</p>
+        </details>
+        <p class="meta small">Tiempo: <time id="receiver-elapsed">00:00</time></p>
+        <p id="receiver-metrics" class="meta small">Rendimiento: —</p>
+        <details class="diagnostics">
+          <summary>Diagnóstico del receptor</summary>
+          <pre id="receiver-debug">Sin iniciar.</pre>
+        </details>
+        <a id="download-link" hidden></a>
+      </section>
+    </main>
+
+    <script src="./vendor/qrcode.min.js"></script>
+    <script src="./vendor/jsQR.js"></script>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
