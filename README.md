@@ -1,6 +1,6 @@
 # Tōna Transfer
 
-MVP de transferencia de archivos binarios de hasta **1.5 MiB** mediante códigos QR animados. El archivo se transporta ópticamente entre pantalla y cámara; no se envía por el backend.
+Plataforma de transferencia de archivos binarios de hasta **1.5 MiB** mediante códigos QR animados. El archivo se transporta ópticamente entre pantalla y cámara; no se envía por el backend. La interfaz permite seleccionar el protocolo de transporte según el dispositivo y el entorno.
 
 ## Separación frontend/backend
 
@@ -83,7 +83,12 @@ El runtime ejecuta Node y Python como el usuario no privilegiado `tona`, limita 
 
 ## Notas del protocolo
 
-La ruta activa usa el protocolo binario `TN2`: Deflate adaptativo (o bytes originales si comprimir no reduce), paquetes QR en modo byte, cabecera compacta, índices y reparaciones XOR FEC. El receptor tolera orden arbitrario, duplicados, paquetes antes de la cabecera y una pérdida por grupo FEC; concatena, descomprime cuando corresponde y valida checksum/tamaño más SHA-256 antes de entregar el archivo.
+Hay dos estrategias seleccionables desde **Emisor**:
+
+1. **Indexado + XOR/NACK (`TN2`)**: protocolo determinista con paquetes fuente indexados, FEC XOR opcional, mapa de faltantes y solicitud óptica de retransmisión. Es la opción recomendada para depurar, reanudar y recuperar pérdidas aisladas.
+2. **Fountain/LT (`TNF`)**: paquetes fuente sistemáticos más ecuaciones XOR aleatorias por ventanas de 32 símbolos. El receptor puede reconstruir varias pérdidas sin canal de retorno; el overhead de reparación se puede elegir entre 10% y 40%.
+
+Ambas estrategias usan Deflate adaptativo (o bytes originales si comprimir no reduce), QR en modo byte, cabecera compacta, orden arbitrario, duplicados y validación de checksum/tamaño más SHA-256 antes de entregar el archivo. Fountain/LT es una implementación compatible de la familia Fountain, no una implementación completa de RaptorQ; el protocolo expone una frontera clara para añadir un codec RaptorQ estandarizado en el futuro.
 
 El QR selecciona automáticamente la versión necesaria con corrección `L` o `M`, usa un margen de cuatro módulos y repite cada paquete según el modo seleccionado. La densidad binaria se puede ajustar entre `400–1800` bytes (`600` por defecto) desde la pestaña **Emisor** sin recompilar. La cabecera se emite al inicio, mitad y final de cada ciclo para que el receptor pueda incorporarse tarde o recuperar metadatos.
 
@@ -95,7 +100,7 @@ La preparación del archivo se ejecuta en `frontend/packet-worker.js`, dejando l
 
 No se comprime Base64 por paquete. Base64 añade aproximadamente 33% de tamaño y al convertir primero el binario a texto se pierde parte de la redundancia que Deflate puede aprovechar. La ruta activa envía directamente bytes QR; Deflate se aplica al archivo completo sólo cuando reduce su tamaño y el codec se registra en la cabecera.
 
-La propuesta de comprimir cada trozo con gzip/LZMA/XZ tiene estas desventajas para esta PoC:
+La propuesta de comprimir cada trozo con gzip/LZMA/XZ tiene estas desventajas para esta implementación:
 
 - Cada trozo independiente repite cabeceras y suele comprimir peor.
 - Gzip/Deflate por trozo aumenta el número de estados y paquetes de control.
@@ -104,10 +109,10 @@ La propuesta de comprimir cada trozo con gzip/LZMA/XZ tiene estas desventajas pa
 
 Para esta arquitectura hay dos caminos sólidos:
 
-1. **Índices + bitmap + FEC + NACK óptico (implementado):** bytes QR, compresión adaptativa, reparaciones XOR, mapa de faltantes y un QR de solicitud que viaja de vuelta desde el receptor al emisor. Es sencillo de inspeccionar, permite reanudar y retransmite sólo lo perdido, pero requiere que el emisor tenga cámara y que ambos dispositivos puedan apuntarse alternativamente.
-2. **Fountain/Raptor simplificado (siguiente evolución):** el emisor transmite combinaciones XOR de bloques con una semilla; el receptor reconstruye cuando obtiene suficientes combinaciones independientes, sin canal de retorno. Tolera mejor pérdidas y movimiento, pero requiere más protocolo, memoria y pruebas matemáticas; ya no se puede mostrar un índice recibido de forma tan directa.
+1. **TN2 indexado:** conviene cuando se pueden orientar ambas cámaras y se necesita reintentar sólo rangos concretos.
+2. **TNF Fountain/LT:** conviene cuando el canal es estrictamente unidireccional, el emisor no tiene cámara o el receptor se mueve; añade símbolos de reparación para compensar pérdidas.
 
-La solución actual conserva la primera alternativa porque es verificable para archivos de hasta 1.5 MiB y permite mostrar exactamente qué paquetes faltan. El contador de tiempo es informativo y se inicia al comenzar la emisión o al activar la cámara. La integridad criptográfica usa SHA-256; todavía no se cifra el contenido, por lo que cualquier persona que vea la pantalla puede reconstruir el archivo.
+El contador de tiempo es informativo y se inicia al comenzar la emisión o al activar la cámara. La integridad criptográfica usa SHA-256; todavía no se cifra el contenido, por lo que cualquier persona que vea la pantalla puede reconstruir el archivo.
 
 Las optimizaciones de transporte binario, FEC, compresión adaptativa, repetición adaptativa, ROI y `requestVideoFrameCallback` están descritas en [docs/TRANSFER-OPTIMIZATION.md](docs/TRANSFER-OPTIMIZATION.md).
 

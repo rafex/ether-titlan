@@ -39,7 +39,7 @@ WASM calcula Deflate y compara su tamaño con el original:
 
 Así JPEG, PNG, ZIP, MP4, PDF comprimidos y archivos cifrados no pagan el coste de una compresión inútil.
 
-### 3. FEC XOR sistemático
+### 3. FEC XOR sistemático en TN2
 
 Por defecto se genera una reparación XOR por cada 8 paquetes de datos. El receptor puede reconstruir automáticamente un paquete perdido de un grupo si recibió los otros siete y la reparación.
 
@@ -47,7 +47,22 @@ La FEC se puede desactivar desde el emisor para minimizar tráfico cuando el enl
 
 FEC no reemplaza Fountain Codes: es una protección sencilla y determinista. Si faltan dos paquetes del mismo grupo, el receptor los muestra como faltantes y solicita sus índices.
 
-### 4. Repetición adaptativa
+### 4. Estrategia Fountain/LT seleccionable
+
+La aplicación también implementa `TNF`, una variante Fountain/LT de ventana acotada:
+
+- cada ventana contiene hasta 32 símbolos fuente;
+- los símbolos fuente se envían sistemáticamente para conservar una ruta rápida cuando el canal es bueno;
+- los símbolos de reparación son ecuaciones XOR con máscaras pseudoaleatorias;
+- el receptor realiza eliminación Gaussiana sobre cada ventana y recupera símbolos perdidos;
+- el overhead de reparación se elige en el frontend: 10%, 20%, 30% o 40%;
+- no necesita NACK ni que el emisor lea una cámara de retorno.
+
+El decodificador conserva el mapa de símbolos resueltos, tolera orden arbitrario y descarta duplicados. La estrategia no pretende ser RaptorQ: RaptorQ requiere un codec estandarizado con sus propios parámetros, distribución de grados y formato de símbolos. `TNF` deja esa interfaz abierta sin mezclar sus paquetes con `TN2`.
+
+La regla práctica es elegir `TN2` en una instalación controlada donde se pueda pedir retransmisión, y `TNF` cuando el receptor tenga movimiento o sólo exista un sentido óptico. Un overhead alto aumenta la tolerancia, pero también aumenta los QR totales y el tiempo de transmisión.
+
+### 5. Repetición adaptativa
 
 El emisor ofrece tres modos:
 
@@ -57,13 +72,13 @@ El emisor ofrece tres modos:
 
 Cuando llega una solicitud de faltantes, el emisor cambia a modo de recuperación y sólo construye una cola con esos índices, sin repetir todos los datos.
 
-### 5. Escaneo por frame real y ROI
+### 6. Escaneo por frame real y ROI
 
 El receptor usa `HTMLVideoElement.requestVideoFrameCallback()` cuando el navegador lo soporta; `requestAnimationFrame()` queda como fallback. Esto evita analizar varias veces el mismo frame de cámara.
 
 Después de detectar un QR, se calcula un rectángulo alrededor de sus cuatro esquinas y los siguientes escaneos usan esa región de interés. Si se pierden diez detecciones consecutivas, el receptor vuelve a analizar todo el vídeo.
 
-### 6. Parámetros de legibilidad
+### 7. Parámetros de legibilidad
 
 La densidad binaria se configura sin recompilar WASM:
 
@@ -91,9 +106,9 @@ Costes:
 - NACK requiere que el emisor lea el QR del receptor;
 - no recupera dos pérdidas dentro del mismo grupo.
 
-### Fountain/Raptor Codes — evolución posible
+### Fountain/LT y RaptorQ
 
-El emisor genera combinaciones de bloques con una semilla y el receptor reconstruye el archivo cuando obtiene suficientes combinaciones independientes.
+La implementación actual genera combinaciones XOR de bloques dentro de ventanas y el receptor reconstruye el archivo cuando obtiene suficientes ecuaciones independientes. Es Fountain/LT simplificado, no RaptorQ completo.
 
 Ventajas:
 
@@ -108,7 +123,7 @@ Costes:
 - requiere tráfico de reparación adicional;
 - la visualización de “qué paquete falta” deja de ser tan directa.
 
-Para archivos de 1.5 MiB, la alternativa actual es el mejor equilibrio. Fountain Codes tiene sentido si se quiere operación estrictamente unidireccional o cámaras muy inestables. El MVP todavía no cifra el payload: SHA-256 detecta corrupción, pero no proporciona confidencialidad.
+Para archivos de 1.5 MiB, ambas rutas son válidas según el canal. Un siguiente adaptador RaptorQ puede reutilizar la interfaz de preparación, el formato de metadatos, el Worker y la telemetría sin cambiar la UX. SHA-256 detecta corrupción, pero no proporciona confidencialidad.
 
 ## Medición recomendada
 
@@ -142,6 +157,7 @@ El protocolo WASM cubre:
 - duplicados, orden arbitrario y mapa de faltantes;
 - validación de checksum, SHA-256, tamaño y nombre;
 - rechazo de payload manipulado.
+- recuperación Fountain/LT de varias pérdidas dentro de una ventana.
 
 Ejecutar:
 

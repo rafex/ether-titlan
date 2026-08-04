@@ -907,6 +907,667 @@ pub fn binary_receiver_info() -> String {
     })
 }
 
+// Windowed LT fountain transport. It keeps source packets systematic and adds
+// XOR equations over windows of 32 chunks. This avoids a large global matrix
+// while allowing the receiver to recover several losses without a NACK.
+const FOUNTAIN_MAGIC: [u8; 3] = *b"TNF";
+const FOUNTAIN_HEADER_TYPE: u8 = 0;
+const FOUNTAIN_DATA_TYPE: u8 = 1;
+const FOUNTAIN_REPAIR_TYPE: u8 = 2;
+const FOUNTAIN_HEADER_FIXED_BYTES: usize = 68;
+const FOUNTAIN_DATA_FIXED_BYTES: usize = 16;
+const FOUNTAIN_REPAIR_FIXED_BYTES: usize = 18;
+const FOUNTAIN_WINDOW_SIZE: usize = 32;
+const FOUNTAIN_MAX_OVERHEAD_PERCENT: usize = 50;
+
+#[derive(Clone, Debug)]
+struct FountainHeader {
+    codec: u8,
+    checksum: u64,
+    digest: [u8; 32],
+    file_size: usize,
+    compressed_size: usize,
+    chunk_size: usize,
+    data_packets: usize,
+    overhead_percent: usize,
+    repair_packets: usize,
+    filename: String,
+}
+
+#[derive(Clone)]
+struct FountainEquation {
+    mask: u32,
+    payload: Vec<u8>,
+}
+
+struct FountainWindow {
+    width: usize,
+    basis: Vec<Option<FountainEquation>>,
+    chunks: Vec<Option<Vec<u8>>>,
+}
+
+impl FountainWindow {
+    fn new(width: usize) -> Self {
+        Self {
+            width,
+            basis: (0..width).map(|_| None).collect(),
+            chunks: (0..width).map(|_| None).collect(),
+        }
+    }
+
+    fn add_equation(&mut self, mut equation: FountainEquation) -> bool {
+        for pivot in 0..self.width {
+            if equation.mask & (1u32 << pivot) == 0 {
+                continue;
+            }
+            let Some(existing) = self.basis[pivot].as_ref() else {
+                self.basis[pivot] = Some(equation);
+                return true;
+            };
+            equation.mask ^= existing.mask;
+            for (left, right) in equation.payload.iter_mut().zip(&existing.payload) {
+                *left ^= right;
+            }
+            if equation.mask == 0 {
+                return false;
+            }
+        }
+        false
+    }
+
+    fn solve(&mut self) -> usize {
+        let mut solved = 0;
+        for pivot in (0..self.width).rev() {
+            let Some(equation) = self.basis[pivot].as_ref() else {
+                continue;
+            };
+            let mut payload = equation.payload.clone();
+            let mut resolvable = true;
+            for bit in (pivot + 1)..self.width {
+                if equation.mask & (1u32 << bit) == 0 {
+                    continue;
+                }
+                let Some(chunk) = self.chunks[bit].as_ref() else {
+                    resolvable = false;
+                    break;
+                };
+                for (left, right) in payload.iter_mut().zip(chunk) {
+                    *left ^= right;
+                }
+            }
+            if resolvable && self.chunks[pivot].is_none() {
+                self.chunks[pivot] = Some(payload);
+                solved += 1;
+            }
+        }
+        solved
+    }
+}
+
+#[derive(Default)]
+struct FountainReceiverState {
+    header: Option<FountainHeader>,
+    windows: HashMap<usize, FountainWindow>,
+    pending: Vec<Vec<u8>>,
+    seen: HashMap<(u8, usize, u32), bool>,
+    received_symbols: usize,
+    received_data: HashMap<usize, bool>,
+    recovered_packets: usize,
+    complete: bool,
+}
+
+#[derive(Serialize)]
+struct FountainReceiverInfo {
+    strategy: String,
+    filename: String,
+    total_packets: usize,
+    received_packets: usize,
+    missing_packets: usize,
+    file_size: usize,
+    compressed_size: usize,
+    checksum: Option<String>,
+    sha256: Option<String>,
+    codec: String,
+    overhead_percent: usize,
+    repair_packets: usize,
+    received_symbols: usize,
+    recovered_packets: usize,
+    complete: bool,
+}
+
+thread_local! {
+    static FOUNTAIN_RECEIVER: RefCell<FountainReceiverState> = RefCell::new(FountainReceiverState::default());
+}
+
+fn next_fountain_random(seed: &mut u32) -> u32 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 17;
+    *seed ^= *seed << 5;
+    *seed
+}
+
+fn fountain_mask(seed: u32, width: usize, repair_index: usize) -> u32 {
+    let mut state = seed
+        .wrapping_add((repair_index as u32).wrapping_mul(0x9e37_79b9))
+        .max(1);
+    let mut mask = 0u32;
+    // Dense random equations are deliberate here: each window is capped at
+    // 32 symbols, so this keeps the XOR decoder small while making several
+    // missing source symbols recoverable with a modest overhead.
+    while mask == 0 {
+        for bit in 0..width {
+            if next_fountain_random(&mut state) & 1 == 1 {
+                mask |= 1u32 << bit;
+            }
+        }
+    }
+    mask
+}
+
+fn fountain_header_packet(header: &FountainHeader) -> Vec<u8> {
+    let filename = header.filename.as_bytes();
+    let mut packet = Vec::with_capacity(FOUNTAIN_HEADER_FIXED_BYTES + filename.len());
+    packet.extend_from_slice(&FOUNTAIN_MAGIC);
+    packet.push(FOUNTAIN_HEADER_TYPE);
+    packet.push(header.codec);
+    packet.push(FOUNTAIN_WINDOW_SIZE as u8);
+    packet.push(0);
+    packet.extend_from_slice(&header.checksum.to_be_bytes());
+    packet.extend_from_slice(&header.digest);
+    push_u32(&mut packet, header.file_size);
+    push_u32(&mut packet, header.compressed_size);
+    push_u16(&mut packet, header.chunk_size);
+    push_u32(&mut packet, header.data_packets);
+    packet.push(header.overhead_percent as u8);
+    push_u32(&mut packet, header.repair_packets);
+    push_u16(&mut packet, filename.len());
+    packet.extend_from_slice(filename);
+    packet
+}
+
+fn build_fountain_packets(
+    buffer: &[u8],
+    filename: &str,
+    chunk_size: usize,
+    overhead_percent: usize,
+) -> Option<Vec<Vec<u8>>> {
+    if !(BINARY_MIN_CHUNK_BYTES..=BINARY_MAX_CHUNK_BYTES).contains(&chunk_size)
+        || overhead_percent > FOUNTAIN_MAX_OVERHEAD_PERCENT
+        || buffer.len() > MAX_FILE_BYTES
+        || filename.is_empty()
+        || filename.len() > MAX_FILENAME_BYTES
+        || filename.chars().any(|character| character.is_control())
+    {
+        return None;
+    }
+
+    let (codec, encoded) = binary_compress(buffer)?;
+    let data_packets = encoded.len().max(1).div_ceil(chunk_size);
+    let checksum = checksum(buffer, filename.as_bytes());
+    let digest = file_digest(buffer, filename.as_bytes());
+    let window_count = data_packets.div_ceil(FOUNTAIN_WINDOW_SIZE);
+    let mut repair_packets = 0;
+    for window in 0..window_count {
+        let width = (data_packets - window * FOUNTAIN_WINDOW_SIZE).min(FOUNTAIN_WINDOW_SIZE);
+        if overhead_percent > 0 {
+            repair_packets += (width * overhead_percent).div_ceil(100).max(1);
+        }
+    }
+    let header = FountainHeader {
+        codec,
+        checksum,
+        digest,
+        file_size: buffer.len(),
+        compressed_size: encoded.len(),
+        chunk_size,
+        data_packets,
+        overhead_percent,
+        repair_packets,
+        filename: filename.to_string(),
+    };
+
+    let mut padded_chunks = Vec::with_capacity(data_packets);
+    for index in 0..data_packets {
+        let start = index * chunk_size;
+        let end = (start + chunk_size).min(encoded.len());
+        let mut chunk = vec![0u8; chunk_size];
+        if start < end {
+            chunk[..end - start].copy_from_slice(&encoded[start..end]);
+        }
+        padded_chunks.push(chunk);
+    }
+
+    let mut packets = vec![fountain_header_packet(&header)];
+    for (index, chunk) in padded_chunks.iter().enumerate() {
+        let start = index * chunk_size;
+        let payload_len = encoded.len().saturating_sub(start).min(chunk_size);
+        let mut packet = Vec::with_capacity(FOUNTAIN_DATA_FIXED_BYTES + payload_len);
+        packet.extend_from_slice(&FOUNTAIN_MAGIC);
+        packet.push(FOUNTAIN_DATA_TYPE);
+        packet.extend_from_slice(&checksum.to_be_bytes());
+        push_u32(&mut packet, index);
+        packet.extend_from_slice(&chunk[..payload_len]);
+        packets.push(packet);
+    }
+
+    let mut repair_number = 0;
+    for window in 0..window_count {
+        let start = window * FOUNTAIN_WINDOW_SIZE;
+        let width = (data_packets - start).min(FOUNTAIN_WINDOW_SIZE);
+        let repair_count = if overhead_percent == 0 {
+            0
+        } else {
+            (width * overhead_percent).div_ceil(100).max(1)
+        };
+        for repair_index in 0..repair_count {
+            let mask = fountain_mask(checksum as u32 ^ window as u32, width, repair_index);
+            let mut payload = vec![0u8; chunk_size];
+            for local in 0..width {
+                if mask & (1u32 << local) == 0 {
+                    continue;
+                }
+                for (left, right) in payload.iter_mut().zip(&padded_chunks[start + local]) {
+                    *left ^= right;
+                }
+            }
+            let mut packet = Vec::with_capacity(FOUNTAIN_REPAIR_FIXED_BYTES + chunk_size);
+            packet.extend_from_slice(&FOUNTAIN_MAGIC);
+            packet.push(FOUNTAIN_REPAIR_TYPE);
+            packet.extend_from_slice(&checksum.to_be_bytes());
+            push_u16(&mut packet, window);
+            packet.extend_from_slice(&mask.to_be_bytes());
+            packet.extend_from_slice(&payload);
+            packets.push(packet);
+            repair_number += 1;
+        }
+    }
+    debug_assert_eq!(repair_number, repair_packets);
+    Some(packets)
+}
+
+#[wasm_bindgen]
+pub fn prepare_fountain_packets(
+    buffer: Vec<u8>,
+    filename: String,
+    chunk_bytes: u32,
+    overhead_percent: u32,
+) -> JsValue {
+    let Some(packets) = build_fountain_packets(
+        &buffer,
+        &filename,
+        chunk_bytes as usize,
+        overhead_percent as usize,
+    ) else {
+        return js_sys::Array::new().into();
+    };
+    let output = js_sys::Array::new();
+    for packet in packets {
+        output.push(&js_sys::Uint8Array::from(packet.as_slice()));
+    }
+    output.into()
+}
+
+fn parse_fountain_header(packet: &[u8]) -> Option<FountainHeader> {
+    if packet.len() < FOUNTAIN_HEADER_FIXED_BYTES
+        || packet.get(..3)? != FOUNTAIN_MAGIC
+        || packet[3] != FOUNTAIN_HEADER_TYPE
+    {
+        return None;
+    }
+    let codec = packet[4];
+    let window_size = packet[5] as usize;
+    let checksum = read_u64(packet, 7)?;
+    let digest: [u8; 32] = packet.get(15..47)?.try_into().ok()?;
+    let file_size = read_u32(packet, 47)?;
+    let compressed_size = read_u32(packet, 51)?;
+    let chunk_size = read_u16(packet, 55)?;
+    let data_packets = read_u32(packet, 57)?;
+    let overhead_percent = packet[61] as usize;
+    let repair_packets = read_u32(packet, 62)?;
+    let filename_len = read_u16(packet, 66)?;
+    let filename_start = FOUNTAIN_HEADER_FIXED_BYTES;
+    let filename_end = filename_start.checked_add(filename_len)?;
+    let filename = String::from_utf8(packet.get(filename_start..filename_end)?.to_vec()).ok()?;
+    if codec > 1
+        || window_size != FOUNTAIN_WINDOW_SIZE
+        || overhead_percent > FOUNTAIN_MAX_OVERHEAD_PERCENT
+        || !(BINARY_MIN_CHUNK_BYTES..=BINARY_MAX_CHUNK_BYTES).contains(&chunk_size)
+        || data_packets == 0
+        || data_packets > BINARY_MAX_PENDING_PACKETS
+        || file_size > MAX_FILE_BYTES
+        || compressed_size > MAX_FILE_BYTES * 2
+        || repair_packets > BINARY_MAX_PENDING_PACKETS
+        || filename.is_empty()
+        || filename.len() > MAX_FILENAME_BYTES
+        || filename.chars().any(|character| character.is_control())
+    {
+        return None;
+    }
+    let expected_packets = compressed_size.max(1).div_ceil(chunk_size);
+    if data_packets != expected_packets {
+        return None;
+    }
+    Some(FountainHeader {
+        codec,
+        checksum,
+        digest,
+        file_size,
+        compressed_size,
+        chunk_size,
+        data_packets,
+        overhead_percent,
+        repair_packets,
+        filename,
+    })
+}
+
+fn fountain_window_mut(
+    state: &mut FountainReceiverState,
+    window: usize,
+) -> Option<&mut FountainWindow> {
+    let header = state.header.as_ref()?;
+    let start = window * FOUNTAIN_WINDOW_SIZE;
+    if start >= header.data_packets {
+        return None;
+    }
+    let width = (header.data_packets - start).min(FOUNTAIN_WINDOW_SIZE);
+    Some(
+        state
+            .windows
+            .entry(window)
+            .or_insert_with(|| FountainWindow::new(width)),
+    )
+}
+
+fn fountain_missing_ranges(state: &FountainReceiverState) -> String {
+    let Some(header) = state.header.as_ref() else {
+        return String::new();
+    };
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < header.data_packets {
+        let present = state
+            .windows
+            .get(&(index / FOUNTAIN_WINDOW_SIZE))
+            .and_then(|window| window.chunks.get(index % FOUNTAIN_WINDOW_SIZE))
+            .is_some_and(Option::is_some);
+        if present {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < header.data_packets {
+            let present = state
+                .windows
+                .get(&(index / FOUNTAIN_WINDOW_SIZE))
+                .and_then(|window| window.chunks.get(index % FOUNTAIN_WINDOW_SIZE))
+                .is_some_and(Option::is_some);
+            if present {
+                break;
+            }
+            index += 1;
+        }
+        let end = index - 1;
+        ranges.push(if start == end {
+            start.to_string()
+        } else {
+            format!("{start}-{end}")
+        });
+    }
+    ranges.join(",")
+}
+
+fn fountain_try_assemble(state: &mut FountainReceiverState) -> Option<Vec<u8>> {
+    let header = state.header.as_ref()?;
+    if state.complete {
+        return None;
+    }
+    let mut compressed = Vec::with_capacity(header.compressed_size);
+    for index in 0..header.data_packets {
+        let chunk = state
+            .windows
+            .get(&(index / FOUNTAIN_WINDOW_SIZE))?
+            .chunks
+            .get(index % FOUNTAIN_WINDOW_SIZE)?
+            .as_ref()?;
+        compressed.extend_from_slice(chunk);
+    }
+    compressed.truncate(header.compressed_size);
+    let file = if header.codec == 1 {
+        decompress_file(&compressed)?
+    } else {
+        compressed
+    };
+    if file.len() != header.file_size
+        || checksum(&file, header.filename.as_bytes()) != header.checksum
+        || file_digest(&file, header.filename.as_bytes()) != header.digest
+    {
+        return None;
+    }
+    state.complete = true;
+    Some(file)
+}
+
+fn install_fountain_header(
+    state: &mut FountainReceiverState,
+    header: FountainHeader,
+) -> Option<Vec<u8>> {
+    let is_new = state
+        .header
+        .as_ref()
+        .is_none_or(|current| current.checksum != header.checksum);
+    let pending = if is_new {
+        let pending = std::mem::take(&mut state.pending);
+        *state = FountainReceiverState {
+            header: Some(header),
+            ..FountainReceiverState::default()
+        };
+        pending
+    } else {
+        Vec::new()
+    };
+    let mut assembled = None;
+    for packet in pending {
+        assembled = process_fountain_inner(state, &packet, false).or(assembled);
+    }
+    assembled.or_else(|| fountain_try_assemble(state))
+}
+
+fn process_fountain_inner(
+    state: &mut FountainReceiverState,
+    packet: &[u8],
+    allow_pending: bool,
+) -> Option<Vec<u8>> {
+    if packet.len() < 4 || packet.get(..3) != Some(&FOUNTAIN_MAGIC) {
+        if allow_pending
+            && state.header.is_none()
+            && state.pending.len() < BINARY_MAX_PENDING_PACKETS
+        {
+            state.pending.push(packet.to_vec());
+        }
+        return None;
+    }
+    match packet[3] {
+        FOUNTAIN_HEADER_TYPE => install_fountain_header(state, parse_fountain_header(packet)?),
+        FOUNTAIN_DATA_TYPE => {
+            let checksum_value = read_u64(packet, 4)?;
+            let index = read_u32(packet, 12)?;
+            let Some(header) = state.header.as_ref() else {
+                if allow_pending && state.pending.len() < BINARY_MAX_PENDING_PACKETS {
+                    state.pending.push(packet.to_vec());
+                }
+                return None;
+            };
+            if checksum_value != header.checksum
+                || index >= header.data_packets
+                || packet.len()
+                    != FOUNTAIN_DATA_FIXED_BYTES
+                        + header
+                            .compressed_size
+                            .saturating_sub(index * header.chunk_size)
+                            .min(header.chunk_size)
+            {
+                return None;
+            }
+            let window = index / FOUNTAIN_WINDOW_SIZE;
+            let local = index % FOUNTAIN_WINDOW_SIZE;
+            let key = (FOUNTAIN_DATA_TYPE, index, 0);
+            if state.seen.insert(key, true).is_none() {
+                state.received_symbols += 1;
+                state.received_data.insert(index, true);
+            }
+            let mut payload = vec![0u8; header.chunk_size];
+            payload[..packet.len() - FOUNTAIN_DATA_FIXED_BYTES]
+                .copy_from_slice(&packet[FOUNTAIN_DATA_FIXED_BYTES..]);
+            let window_state = fountain_window_mut(state, window)?;
+            window_state.add_equation(FountainEquation {
+                mask: 1u32 << local,
+                payload,
+            });
+            let _ = window_state.solve();
+            fountain_try_assemble(state)
+        }
+        FOUNTAIN_REPAIR_TYPE => {
+            let checksum_value = read_u64(packet, 4)?;
+            let window = read_u16(packet, 12)?;
+            let mask = u32::from_be_bytes(packet.get(14..18)?.try_into().ok()?);
+            let Some(header) = state.header.as_ref() else {
+                if allow_pending && state.pending.len() < BINARY_MAX_PENDING_PACKETS {
+                    state.pending.push(packet.to_vec());
+                }
+                return None;
+            };
+            let width =
+                (header.data_packets - window * FOUNTAIN_WINDOW_SIZE).min(FOUNTAIN_WINDOW_SIZE);
+            let key = (FOUNTAIN_REPAIR_TYPE, window, mask);
+            if checksum_value != header.checksum
+                || window * FOUNTAIN_WINDOW_SIZE >= header.data_packets
+                || mask == 0
+                || (width < 32 && mask >> width != 0)
+                || packet.len() != FOUNTAIN_REPAIR_FIXED_BYTES + header.chunk_size
+            {
+                return None;
+            }
+            if state.seen.insert(key, true).is_none() {
+                state.received_symbols += 1;
+            }
+            let recovered_locals = {
+                let window_state = fountain_window_mut(state, window)?;
+                window_state.add_equation(FountainEquation {
+                    mask,
+                    payload: packet[FOUNTAIN_REPAIR_FIXED_BYTES..].to_vec(),
+                });
+                let _ = window_state.solve();
+                (0..width)
+                    .filter(|local| window_state.chunks[*local].is_some())
+                    .collect::<Vec<_>>()
+            };
+            for local in recovered_locals {
+                let index = window * FOUNTAIN_WINDOW_SIZE + local;
+                if state.received_data.insert(index, true).is_none() {
+                    state.recovered_packets += 1;
+                }
+            }
+            fountain_try_assemble(state)
+        }
+        _ => None,
+    }
+}
+
+#[wasm_bindgen]
+pub fn reset_fountain_receiver() {
+    FOUNTAIN_RECEIVER.with(|receiver| *receiver.borrow_mut() = FountainReceiverState::default());
+}
+
+#[wasm_bindgen]
+pub fn process_fountain_packet(packet: Vec<u8>) -> Option<Vec<u8>> {
+    FOUNTAIN_RECEIVER
+        .with(|receiver| process_fountain_inner(&mut receiver.borrow_mut(), &packet, true))
+}
+
+#[wasm_bindgen]
+pub fn fountain_receiver_progress() -> Vec<u32> {
+    FOUNTAIN_RECEIVER.with(|receiver| {
+        let state = receiver.borrow();
+        let total = state
+            .header
+            .as_ref()
+            .map_or(0, |header| header.data_packets);
+        let received = state
+            .windows
+            .values()
+            .flat_map(|window| window.chunks.iter())
+            .filter(|chunk| chunk.is_some())
+            .count();
+        vec![received as u32, total as u32]
+    })
+}
+
+#[wasm_bindgen]
+pub fn fountain_receiver_packet_map() -> Vec<u8> {
+    FOUNTAIN_RECEIVER.with(|receiver| {
+        let state = receiver.borrow();
+        let total = state
+            .header
+            .as_ref()
+            .map_or(0, |header| header.data_packets);
+        (0..total)
+            .map(|index| {
+                u8::from(
+                    state
+                        .windows
+                        .get(&(index / FOUNTAIN_WINDOW_SIZE))
+                        .and_then(|window| window.chunks.get(index % FOUNTAIN_WINDOW_SIZE))
+                        .is_some_and(Option::is_some),
+                )
+            })
+            .collect()
+    })
+}
+
+#[wasm_bindgen]
+pub fn fountain_receiver_missing_ranges() -> String {
+    FOUNTAIN_RECEIVER.with(|receiver| fountain_missing_ranges(&receiver.borrow()))
+}
+
+#[wasm_bindgen]
+pub fn fountain_receiver_info() -> String {
+    FOUNTAIN_RECEIVER.with(|receiver| {
+        let state = receiver.borrow();
+        let Some(header) = state.header.as_ref() else {
+            return "{}".to_string();
+        };
+        let received_packets = fountain_receiver_progress_internal(&state);
+        let info = FountainReceiverInfo {
+            strategy: "fountain-lt".to_string(),
+            filename: header.filename.clone(),
+            total_packets: header.data_packets,
+            received_packets,
+            missing_packets: header.data_packets.saturating_sub(received_packets),
+            file_size: header.file_size,
+            compressed_size: header.compressed_size,
+            checksum: Some(format!("{:016x}", header.checksum)),
+            sha256: Some(bytes_hex(&header.digest)),
+            codec: if header.codec == 1 { "deflate" } else { "raw" }.to_string(),
+            overhead_percent: header.overhead_percent,
+            repair_packets: header.repair_packets,
+            received_symbols: state.received_symbols,
+            recovered_packets: state.recovered_packets,
+            complete: state.complete,
+        };
+        serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string())
+    })
+}
+
+fn fountain_receiver_progress_internal(state: &FountainReceiverState) -> usize {
+    state
+        .windows
+        .values()
+        .flat_map(|window| window.chunks.iter())
+        .filter(|chunk| chunk.is_some())
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,6 +1689,39 @@ mod tests {
         let output = process_binary_packet(packets[0].clone()).expect("pending data");
         assert_eq!(output, input);
         assert!(binary_receiver_info().contains("antes.dat"));
+    }
+
+    #[test]
+    fn fountain_protocol_recovers_multiple_missing_source_packets() {
+        let mut seed = 0x3141_5926u32;
+        let input: Vec<u8> = (0..20_000)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let packets = build_fountain_packets(&input, "fountain.bin", 600, 30).expect("packets");
+        reset_fountain_receiver();
+        let mut output = None;
+        for packet in &packets {
+            let skip = packet.get(3) == Some(&FOUNTAIN_DATA_TYPE)
+                && matches!(read_u32(packet, 12), Some(3 | 7 | 11));
+            if !skip {
+                output = process_fountain_packet(packet.clone()).or(output);
+            }
+        }
+        let output = match output {
+            Some(output) => output,
+            None => {
+                let info = fountain_receiver_info();
+                let missing =
+                    FOUNTAIN_RECEIVER.with(|receiver| fountain_missing_ranges(&receiver.borrow()));
+                panic!("fountain should assemble file: info={info} missing={missing}");
+            }
+        };
+        assert_eq!(output, input);
+        assert!(fountain_receiver_info().contains("fountain-lt"));
+        assert!(fountain_receiver_info().contains("\"recovered_packets\":3"));
     }
 
     #[test]

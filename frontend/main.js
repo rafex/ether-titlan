@@ -5,9 +5,16 @@ import init, {
   binary_receiver_missing_ranges,
   binary_receiver_packet_map,
   binary_receiver_progress,
+  fountain_receiver_info,
+  fountain_receiver_missing_ranges,
+  fountain_receiver_packet_map,
+  fountain_receiver_progress,
   prepare_binary_packets,
+  prepare_fountain_packets,
   process_binary_packet,
+  process_fountain_packet,
   reset_binary_receiver,
+  reset_fountain_receiver,
 } from "./pkg/qr_file_transfer.js";
 
 const MAX_FILE_BYTES = 1.5 * 1024 * 1024;
@@ -30,6 +37,7 @@ const sender = {
   packetFrames: 0,
   repeatMode: "auto",
   recoveryMode: false,
+  strategy: "indexed",
   prepareToken: 0,
   metrics: { frames: 0, packets: 0, bytes: 0 },
   clock: { startedAt: null, elapsedMs: 0, timer: null },
@@ -42,6 +50,7 @@ const receiver = {
   logLines: [],
   stats: { frames: 0, qrDetections: 0, duplicates: 0, packets: 0 },
   persistenceError: false,
+  strategy: "indexed",
   controlRendering: false,
   controlPayload: "",
   roi: null,
@@ -64,7 +73,7 @@ const senderControlScanContext = senderControlScanCanvas.getContext("2d", { will
 const receiverPacketMapCanvas = $("receiver-packet-map");
 const receiverPacketMapContext = receiverPacketMapCanvas.getContext("2d");
 const receiverControlCanvas = $("receiver-control-canvas");
-const RECEIVER_DB_NAME = "tona-transfer-mvp";
+const RECEIVER_DB_NAME = "tona-transfer-sessions-v2";
 const RECEIVER_DB_VERSION = 1;
 const RECEIVER_STORE_NAME = "packets";
 let receiverDbPromise = null;
@@ -92,8 +101,10 @@ try {
 
 function preparePacketsInWorker(buffer, filename, settings) {
   if (!packetWorker) {
-    return Promise.resolve(Array.from(prepare_binary_packets(
-      new Uint8Array(buffer), filename, settings.chunkBytes, settings.fecGroupSize,
+    const prepare = settings.strategy === "fountain" ? prepare_fountain_packets : prepare_binary_packets;
+    const option = settings.strategy === "fountain" ? settings.fountainOverhead : settings.fecGroupSize;
+    return Promise.resolve(Array.from(prepare(
+      new Uint8Array(buffer), filename, settings.chunkBytes, option,
     ), (packet) => new Uint8Array(packet)));
   }
   const id = ++packetRequestId;
@@ -105,6 +116,8 @@ function preparePacketsInWorker(buffer, filename, settings) {
       filename,
       chunkBytes: settings.chunkBytes,
       fecGroupSize: settings.fecGroupSize,
+      fountainOverhead: settings.fountainOverhead,
+      strategy: settings.strategy,
     }, [buffer]);
   });
 }
@@ -185,7 +198,7 @@ function updateSenderMetrics() {
 
 function updateReceiverMetrics() {
   const elapsed = Math.max(clockValue(receiver.clock) / 1000, 0.001);
-  const info = JSON.parse(binary_receiver_info() || "{}");
+  const info = transferReceiverInfo();
   const receivedBytes = info.file_size && info.total_packets
     ? info.file_size * (info.received_packets / info.total_packets)
     : 0;
@@ -193,15 +206,34 @@ function updateReceiverMetrics() {
   $("receiver-metrics").textContent = `Rendimiento: ${formatRate(receivedBytes / elapsed)} · detecciones ${detectionRate.toFixed(1)}/s · frames ${receiver.stats.frames} · duplicados ${receiver.stats.duplicates}`;
 }
 
+function transferReceiverInfo() {
+  return JSON.parse((receiver.strategy === "fountain" ? fountain_receiver_info() : binary_receiver_info()) || "{}");
+}
+
+function transferReceiverProgress() {
+  return receiver.strategy === "fountain" ? fountain_receiver_progress() : binary_receiver_progress();
+}
+
+function transferReceiverMap() {
+  return receiver.strategy === "fountain" ? fountain_receiver_packet_map() : binary_receiver_packet_map();
+}
+
+function transferReceiverMissingRanges() {
+  return receiver.strategy === "fountain" ? fountain_receiver_missing_ranges() : binary_receiver_missing_ranges();
+}
+
+function processTransferPacket(packet) {
+  receiver.strategy = packetMagic(packet);
+  return receiver.strategy === "fountain"
+    ? process_fountain_packet(packet)
+    : process_binary_packet(packet);
+}
+
 function receiverPacketKey(packet) {
   const type = packet?.[3];
   const transfer = packetChecksum(packet);
-  if (type === 0) return `header:${transfer}`;
-  if ((type === 1 || type === 2) && packet.length >= 16) {
-    const index = new DataView(packet.buffer, packet.byteOffset, packet.byteLength).getUint32(12);
-    return `${type === 1 ? "data" : "parity"}:${transfer}:${index}`;
-  }
-  return `packet:${transfer}:${packet.length}`;
+  const identity = Array.from(packet.slice(12, 28)).join(",");
+  return `${type}:${transfer}:${identity}:${packet.length}`;
 }
 
 function openReceiverDb() {
@@ -247,7 +279,7 @@ async function restoreReceiverSession() {
     });
     let assembled = null;
     for (const record of records) {
-      assembled = process_binary_packet(new Uint8Array(record.packet)) || assembled;
+      assembled = processTransferPacket(new Uint8Array(record.packet)) || assembled;
     }
     if (records.length) receiverLog("Sesión local restaurada", { packets: records.length });
     return assembled;
@@ -274,8 +306,10 @@ async function clearReceiverSessionStore() {
 
 function qrSettings() {
   return {
+    strategy: $("transfer-strategy").value,
     chunkBytes: Number($("qr-chunk-size").value),
     fecGroupSize: Number($("qr-fec-group").value),
+    fountainOverhead: Number($("fountain-overhead").value),
     repeatMode: $("qr-repeat-mode").value,
     errorCorrectionLevel: $("qr-error-correction").value,
   };
@@ -293,8 +327,16 @@ function qrOptions() {
 function updateQrSettingsLabel() {
   const settings = qrSettings();
   const readability = settings.chunkBytes <= 800 ? "alta" : settings.chunkBytes <= 1200 ? "media" : "baja";
-  const fec = settings.fecGroupSize ? `FEC 1/${settings.fecGroupSize}` : "sin FEC";
-  $("qr-settings-label").textContent = `${settings.chunkBytes} bytes por paquete · legibilidad ${readability} · ${fec} · corrección ${settings.errorCorrectionLevel}`;
+  const recovery = settings.strategy === "fountain"
+    ? `Fountain/LT +${settings.fountainOverhead}%`
+    : settings.fecGroupSize ? `FEC 1/${settings.fecGroupSize}` : "sin FEC";
+  $("qr-settings-label").textContent = `${settings.chunkBytes} bytes · legibilidad ${readability} · ${recovery} · corrección ${settings.errorCorrectionLevel}`;
+  $("indexed-settings").hidden = settings.strategy === "fountain";
+  $("fountain-settings").hidden = settings.strategy !== "fountain";
+  $("missing-settings").hidden = settings.strategy === "fountain";
+  $("strategy-description").textContent = settings.strategy === "fountain"
+    ? "Fountain/LT: transmite símbolos originales y reparaciones combinadas; tolera varias pérdidas sin canal de retorno."
+    : "Indexado: muestra faltantes, recupera una pérdida por grupo y permite retransmitir rangos concretos.";
 }
 
 function qrBinaryPayload(packet) {
@@ -308,6 +350,26 @@ function packetChecksum(packet) {
 
 function packetType(packet) {
   return packet?.[3];
+}
+
+function packetMagic(packet) {
+  return packet?.[0] === 0x54 && packet?.[1] === 0x4e && packet?.[2] === 0x46 ? "fountain" : "indexed";
+}
+
+function parseSenderMetadata(header, packets, strategy) {
+  const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+  const fountain = strategy === "fountain";
+  return {
+    strategy,
+    checksum: packetChecksum(header),
+    dataPackets: view.getUint32(57),
+    chunkBytes: view.getUint16(55),
+    fecGroupSize: fountain ? 0 : header[5],
+    fountainOverhead: fountain ? header[61] : 0,
+    repairPackets: fountain ? view.getUint32(62) : packets.filter((packet) => packetType(packet) === 2).length,
+    parityPackets: packets.filter((packet) => packetType(packet) === 2).length,
+    codec: header[4] === 1 ? "deflate" : "raw",
+  };
 }
 
 function senderDataPacketCount() {
@@ -349,11 +411,12 @@ function updateSenderProgress() {
   $("sender-progress-label").textContent = entry?.kind === "header"
     ? `Cabecera · envío ${current} de ${queueTotal}`
     : entry?.kind === "parity"
-      ? `FEC reparación · envío ${current} de ${queueTotal}`
+      ? `${sender.strategy === "fountain" ? "Fountain reparación" : "FEC reparación"} · envío ${current} de ${queueTotal}`
     : `Paquete ${entry ? entry.dataIndex + 1 : 0} de ${totalData} · envío ${current} de ${queueTotal}`;
   const selected = sender.selectedDataIndexes ? sender.selectedDataIndexes.length : totalData;
   const parity = sender.selectedDataIndexes ? 0 : senderParityPacketCount();
-  $("sender-packet-meta").innerHTML = `Datos: ${selected} de ${totalData} · reparación FEC: ${parity} · tiempo: <time id="sender-elapsed">${formatElapsed(clockValue(sender.clock))}</time>`;
+  const repairLabel = sender.strategy === "fountain" ? "reparaciones Fountain" : "reparación FEC";
+  $("sender-packet-meta").innerHTML = `Datos: ${selected} de ${totalData} · ${repairLabel}: ${parity} · tiempo: <time id="sender-elapsed">${formatElapsed(clockValue(sender.clock))}</time>`;
   updateSenderMetrics();
 }
 
@@ -404,6 +467,7 @@ function parseMissingRanges(value, total) {
 }
 
 function applyMissingSelection(value, source = "manual") {
+  if (sender.strategy === "fountain") throw new Error("Fountain/LT no usa rangos faltantes; ajusta el overhead o continúa transmitiendo símbolos.");
   const total = senderDataPacketCount();
   if (!sender.packets.length) throw new Error("Selecciona un archivo antes de aplicar faltantes.");
   const indexes = parseMissingRanges(value, total);
@@ -422,23 +486,26 @@ function applyMissingSelection(value, source = "manual") {
 }
 
 function updateReceiverProgress() {
-  const [received, total] = binary_receiver_progress();
+  const [received, total] = transferReceiverProgress();
   $("receiver-progress").max = Math.max(total, 1);
   $("receiver-progress").value = received;
   $("receiver-progress-label").textContent = `Paquetes recibidos: ${received} de ${total}`;
-  const info = JSON.parse(binary_receiver_info() || "{}");
+  const info = transferReceiverInfo();
   if (info.filename) {
     const size = info.file_size ? `${(info.file_size / 1024).toFixed(1)} KiB` : "tamaño desconocido";
     const compressed = info.compressed_size ? ` · comprimido ${(info.compressed_size / 1024).toFixed(1)} KiB` : "";
     const fec = info.fec_group_size ? ` · FEC recuperados ${info.recovered_packets || 0}` : "";
-    $("receiver-file-meta").textContent = `Archivo: ${info.filename} · ${size}${compressed} · ${info.codec || "—"}${fec} · checksum ${info.checksum || "—"}`;
+    const fountain = info.strategy === "fountain-lt"
+      ? ` · Fountain/LT +${info.overhead_percent || 0}% · símbolos ${info.received_symbols || 0} · recuperados ${info.recovered_packets || 0}`
+      : "";
+    $("receiver-file-meta").textContent = `Archivo: ${info.filename} · ${size}${compressed} · ${info.codec || "—"}${fec}${fountain} · checksum ${info.checksum || "—"}`;
   } else {
     $("receiver-file-meta").textContent = "Archivo: pendiente de cabecera.";
   }
-  const missing = binary_receiver_missing_ranges();
+  const missing = transferReceiverMissingRanges();
   const visibleMissing = missing.length > 600 ? `${missing.slice(0, 600)}…` : missing;
   $("receiver-missing-label").textContent = visibleMissing ? `Faltantes: ${visibleMissing}` : (total ? "Faltantes: ninguno" : "Faltantes: —");
-  drawReceiverPacketMap(binary_receiver_packet_map());
+  drawReceiverPacketMap(transferReceiverMap());
   updateReceiverControlQr();
   updateReceiverMetrics();
 }
@@ -466,7 +533,15 @@ function drawReceiverPacketMap(packetMap) {
 }
 
 function updateReceiverControlQr() {
+  const controlDetails = $("receiver-control-details");
+  if (controlDetails) controlDetails.hidden = receiver.strategy === "fountain";
   if (!window.QRCode || receiver.controlRendering) return;
+  if (receiver.strategy === "fountain") {
+    receiver.controlPayload = "";
+    receiverControlCanvas.getContext("2d").clearRect(0, 0, receiverControlCanvas.width, receiverControlCanvas.height);
+    $("receiver-control-status").textContent = "Fountain/LT no requiere canal de retorno.";
+    return;
+  }
   const payload = binary_receiver_control_packet();
   receiver.controlPayload = payload;
   if (!payload) {
@@ -611,8 +686,10 @@ async function loadFile(file) {
       packets = await preparePacketsInWorker(buffer, file.name, settings);
     } catch (error) {
       console.warn("Worker de paquetes no disponible; usando fallback síncrono.", error);
-      packets = Array.from(prepare_binary_packets(
-        new Uint8Array(fallbackBuffer), file.name, settings.chunkBytes, settings.fecGroupSize,
+      const prepare = settings.strategy === "fountain" ? prepare_fountain_packets : prepare_binary_packets;
+      const option = settings.strategy === "fountain" ? settings.fountainOverhead : settings.fecGroupSize;
+      packets = Array.from(prepare(
+        new Uint8Array(fallbackBuffer), file.name, settings.chunkBytes, option,
       ), (packet) => new Uint8Array(packet));
     }
     if (prepareToken !== sender.prepareToken) return;
@@ -620,14 +697,8 @@ async function loadFile(file) {
     if (!sender.packets.length) throw new Error("WASM rechazó el archivo o el nombre es demasiado largo.");
     sender.file = file;
     const header = sender.packets[0];
-    sender.metadata = {
-      checksum: packetChecksum(header),
-      dataPackets: new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(57),
-      chunkBytes: new DataView(header.buffer, header.byteOffset, header.byteLength).getUint16(55),
-      fecGroupSize: header[5],
-      parityPackets: sender.packets.filter((packet) => packetType(packet) === 2).length,
-      codec: header[4] === 1 ? "deflate" : "raw",
-    };
+    sender.strategy = settings.strategy;
+    sender.metadata = parseSenderMetadata(header, sender.packets, settings.strategy);
     buildSenderQueue();
     $("start-sender").disabled = false;
     $("reset-sender").disabled = false;
@@ -647,6 +718,10 @@ function handleReceiverRequest(payload) {
   }
   if (fields[1] !== sender.metadata?.checksum) {
     setStatus($("sender-file"), "La solicitud pertenece a otro archivo.", true);
+    return true;
+  }
+  if (sender.strategy === "fountain") {
+    setStatus($("sender-file"), "Fountain/LT no usa solicitudes NACK; continúa emitiendo símbolos y reparaciones.");
     return true;
   }
   try {
@@ -827,7 +902,8 @@ function describeCameraError(error) {
 }
 
 function finishDownload(bytes) {
-  const filename = binary_receiver_filename() || "archivo-recibido.bin";
+  const info = transferReceiverInfo();
+  const filename = info.filename || binary_receiver_filename() || "archivo-recibido.bin";
   pauseClock(receiver.clock, "receiver-elapsed");
   const blob = new Blob([bytes], { type: "application/octet-stream" });
   const url = URL.createObjectURL(blob);
@@ -970,7 +1046,7 @@ function scanReceiverFrame() {
   });
   try {
     const packet = new Uint8Array(code.binaryData);
-    const assembled = process_binary_packet(packet);
+    const assembled = processTransferPacket(packet);
     persistReceiverPacket(packet);
     receiver.stats.packets += 1;
     updateReceiverProgress();
@@ -988,6 +1064,8 @@ function scanReceiverFrame() {
 async function resetReceiverSession() {
   stopReceiver();
   reset_binary_receiver();
+  reset_fountain_receiver();
+  receiver.strategy = "indexed";
   receiver.lastPacket = "";
   receiver.roi = null;
   receiver.roiMisses = 0;
@@ -1030,6 +1108,8 @@ async function startReceiver() {
     resetClock(receiver.clock, "receiver-elapsed");
     receiverLog("Solicitando cámara");
     reset_binary_receiver();
+    reset_fountain_receiver();
+    receiver.strategy = "indexed";
     receiver.lastPacket = "";
     updateReceiverProgress();
     const restored = await restoreReceiverSession();
@@ -1126,6 +1206,14 @@ $("qr-error-correction").addEventListener("change", () => {
   if (sender.file) loadFile(sender.file);
 });
 $("qr-fec-group").addEventListener("change", () => {
+  updateQrSettingsLabel();
+  if (sender.file) loadFile(sender.file);
+});
+$("transfer-strategy").addEventListener("change", () => {
+  updateQrSettingsLabel();
+  if (sender.file) loadFile(sender.file);
+});
+$("fountain-overhead").addEventListener("change", () => {
   updateQrSettingsLabel();
   if (sender.file) loadFile(sender.file);
 });
