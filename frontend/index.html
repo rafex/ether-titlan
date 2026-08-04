@@ -28,7 +28,7 @@
       .panel-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
       .panel-header h2 { margin-bottom: 5px; }
       .eyebrow { margin: 0; color: #8de6bd; font-size: .75rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
-      .transfer-grid { display: grid; grid-template-columns: minmax(0, .95fr) minmax(320px, 1.05fr); gap: clamp(18px, 3vw, 32px); align-items: start; }
+      .transfer-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: clamp(18px, 3vw, 32px); align-items: start; }
       .surface { padding: 14px; border: 1px solid #26344e; border-radius: 14px; background: #0f192c; }
       .drop-zone { border: 2px dashed #50678f; border-radius: 14px; padding: 34px 18px; text-align: center; transition: border-color .2s, background .2s; }
       .drop-zone.dragover { border-color: #36b37e; background: #172b38; }
@@ -68,6 +68,9 @@
       #sender-canvas { width: min(100%, 640px); height: auto; margin: 0 auto; }
       .progress-wrap { padding: 12px 0 0; }
       button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-visible { outline: 3px solid rgba(141, 230, 189, .7); outline-offset: 2px; }
+      @media (min-width: 1000px) {
+        .transfer-grid { grid-template-columns: minmax(0, .9fr) minmax(420px, 1.1fr); }
+      }
       @media (max-width: 760px) {
         main { padding-left: 12px; padding-right: 12px; }
         .app-header { display: block; }
